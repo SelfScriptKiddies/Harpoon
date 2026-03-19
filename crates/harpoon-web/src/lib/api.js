@@ -1,6 +1,6 @@
 /** Harpoon API client */
 
-let token = $state(localStorage.getItem('harpoon_token') || '');
+let token = localStorage.getItem('harpoon_token') || '';
 
 export function getToken() { return token; }
 export function setToken(t) { token = t; localStorage.setItem('harpoon_token', t); }

@@ -12,7 +12,7 @@
   <div class="node-header" style="background: {kindDef?.color}20; border-bottom-color: {kindDef?.color}30;">
     <span class="node-dot" style="background: {kindDef?.color};"></span>
     <span class="node-label">{kindDef?.label || node.kind}</span>
-    <button class="node-remove" onclick|stopPropagation={onRemove}>×</button>
+    <button class="node-remove" onclick={(e) => { e.stopPropagation(); onRemove(); }}>×</button>
   </div>
 
   <div class="node-body">
@@ -33,7 +33,7 @@
   <!-- Output port -->
   {#if kindDef?.ports?.out}
     <!-- svelte-ignore a11y_no_static_element_interactions -->
-    <div class="node-port node-port-out" onmousedown|stopPropagation={onConnectStart}></div>
+    <div class="node-port node-port-out" onmousedown={(e) => { e.stopPropagation(); onConnectStart(e); }}></div>
   {/if}
   <!-- Input port -->
   {#if kindDef?.ports?.in}
