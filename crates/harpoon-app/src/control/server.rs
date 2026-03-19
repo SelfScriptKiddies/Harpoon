@@ -22,6 +22,7 @@ pub struct ControlState {
     pub cancel: CancellationToken,
     pub recent_events: Arc<Mutex<Vec<EventInfo>>>,
     pub reload_tx: tokio::sync::mpsc::Sender<PathBuf>,
+    pub app_config: Option<crate::config::schema::AppConfig>,
 }
 
 pub async fn run_control_server(

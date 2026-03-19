@@ -51,6 +51,7 @@ async fn run_engine_loop(config_path: PathBuf, socket_path: &std::path::Path) ->
     #[cfg(feature = "web")]
     let _web_password = app_config.global.web_password.clone();
 
+    let saved_app_config = app_config.clone();
     let core_config = convert(app_config).context("converting config")?;
     let rules_info = build_rules_info(&core_config);
 
@@ -71,6 +72,7 @@ async fn run_engine_loop(config_path: PathBuf, socket_path: &std::path::Path) ->
         cancel: cancel.clone(),
         recent_events: Arc::new(Mutex::new(Vec::new())),
         reload_tx,
+        app_config: Some(saved_app_config),
     }));
 
     // Spawn control server
@@ -161,6 +163,15 @@ async fn reload_engine(
 ) -> Result<()> {
     let app_config = load_config(config_path)
         .with_context(|| format!("loading config from {}", config_path.display()))?;
+    apply_app_config(state, app_config, config_path).await
+}
+
+pub async fn apply_app_config(
+    state: &Arc<RwLock<ControlState>>,
+    app_config: crate::config::schema::AppConfig,
+    config_path: &std::path::Path,
+) -> Result<()> {
+    let saved = app_config.clone();
     let core_config = convert(app_config).context("converting config")?;
     let new_rules_info = build_rules_info(&core_config);
 
@@ -183,6 +194,7 @@ async fn reload_engine(
         s.engine_handle = Some(new_handle);
         s.rules_info = new_rules_info;
         s.config_path = config_path.to_path_buf();
+        s.app_config = Some(saved);
         s.recent_events.lock().await.clear();
     }
 

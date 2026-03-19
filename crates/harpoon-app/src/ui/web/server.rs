@@ -40,6 +40,10 @@ pub async fn run_web_server(
         .route("/api/status", get(api_status))
         .route("/api/stats", get(api_stats))
         .route("/api/rules", get(api_rules))
+        .route("/api/rules/full", get(api_rules_full))
+        .route("/api/rules/create", post(api_rule_create))
+        .route("/api/rules/update", post(api_rule_update))
+        .route("/api/rules/delete", post(api_rule_delete))
         .route("/api/events", get(api_events))
         .route("/api/reload", post(api_reload))
         .route("/api/stop", post(api_stop))
@@ -153,6 +157,18 @@ async fn api_rules(
     Ok(Json(s.rules_info.clone()))
 }
 
+async fn api_rules_full(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<crate::config::schema::AppRule>>, StatusCode> {
+    require_auth!(state, headers);
+    let s = state.control.read().await;
+    match &s.app_config {
+        Some(cfg) => Ok(Json(cfg.rules.clone())),
+        None => Ok(Json(vec![])),
+    }
+}
+
 async fn api_events(
     State(state): State<Arc<WebState>>,
     headers: HeaderMap,
@@ -185,6 +201,111 @@ async fn api_stop(
     require_auth!(state, headers);
     let s = state.control.read().await;
     s.cancel.cancel();
+    Ok(Json(serde_json::json!({"ok": true})))
+}
+
+async fn api_rule_create(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+    Json(new_rule): Json<crate::config::schema::AppRule>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_auth!(state, headers);
+    modify_rules(&state, |rules| {
+        if rules.iter().any(|r| r.name == new_rule.name) {
+            return Err("rule with this name already exists".into());
+        }
+        rules.push(new_rule);
+        Ok(())
+    })
+    .await
+}
+
+#[derive(serde::Deserialize)]
+struct RuleUpdateReq {
+    original_name: String,
+    rule: crate::config::schema::AppRule,
+}
+
+async fn api_rule_update(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+    Json(req): Json<RuleUpdateReq>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_auth!(state, headers);
+    modify_rules(&state, |rules| {
+        let idx = rules
+            .iter()
+            .position(|r| r.name == req.original_name)
+            .ok_or_else(|| format!("rule '{}' not found", req.original_name))?;
+        rules[idx] = req.rule;
+        Ok(())
+    })
+    .await
+}
+
+#[derive(serde::Deserialize)]
+struct RuleDeleteReq {
+    name: String,
+}
+
+async fn api_rule_delete(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+    Json(req): Json<RuleDeleteReq>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_auth!(state, headers);
+    modify_rules(&state, |rules| {
+        let idx = rules
+            .iter()
+            .position(|r| r.name == req.name)
+            .ok_or_else(|| format!("rule '{}' not found", req.name))?;
+        rules.remove(idx);
+        Ok(())
+    })
+    .await
+}
+
+/// Modify rules in the AppConfig, save to disk, and reload the engine.
+async fn modify_rules<F>(
+    state: &Arc<WebState>,
+    f: F,
+) -> Result<Json<serde_json::Value>, StatusCode>
+where
+    F: FnOnce(&mut Vec<crate::config::schema::AppRule>) -> Result<(), String>,
+{
+    let (mut app_config, config_path) = {
+        let s = state.control.read().await;
+        let cfg = s.app_config.clone().ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+        (cfg, s.config_path.clone())
+    };
+
+    if let Err(msg) = f(&mut app_config.rules) {
+        return Ok(Json(serde_json::json!({"ok": false, "error": msg})));
+    }
+
+    // Validate by attempting conversion
+    if let Err(e) = crate::convert::convert(app_config.clone()) {
+        return Ok(Json(
+            serde_json::json!({"ok": false, "error": format!("validation: {e}")}),
+        ));
+    }
+
+    // Save to disk
+    if let Err(e) = crate::config::load::save_config(&config_path, &app_config) {
+        return Ok(Json(
+            serde_json::json!({"ok": false, "error": format!("save: {e}")}),
+        ));
+    }
+
+    // Apply: stop old engine, start new
+    if let Err(e) =
+        crate::daemon::run::apply_app_config(&state.control, app_config, &config_path).await
+    {
+        return Ok(Json(
+            serde_json::json!({"ok": false, "error": format!("apply: {e}")}),
+        ));
+    }
+
     Ok(Json(serde_json::json!({"ok": true})))
 }
 

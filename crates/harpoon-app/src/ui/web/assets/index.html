@@ -223,11 +223,73 @@ tr:hover td { background:var(--bg-3); }
 
     <!-- RULES -->
     <div class="page" id="page-rules">
-      <div class="section-title">Rules <span class="count" id="rules-count2">0</span></div>
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;">
+        <div class="section-title" style="margin-bottom:0;">Rules <span class="count" id="rules-count2">0</span></div>
+        <button class="btn btn-accent" onclick="openRuleForm()">+ Create Rule</button>
+      </div>
       <div class="tbl-wrap"><table><thead><tr>
-        <th>Name</th><th>Protocol</th><th>Listen</th><th>Target</th><th>Filters</th><th>Duplicate</th><th>Exporter</th>
+        <th>Name</th><th>Proto</th><th>Listen</th><th>Target</th><th>Filters</th><th>Dup</th><th>Exp</th><th style="width:120px;">Actions</th>
       </tr></thead><tbody id="rules-table"></tbody></table></div>
       <div id="rule-detail" style="margin-top:16px;"></div>
+
+      <!-- RULE FORM (hidden by default) -->
+      <div id="rule-form-overlay" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);z-index:100;display:none;align-items:flex-start;justify-content:center;padding-top:60px;overflow-y:auto;">
+        <div style="background:var(--bg-2);border:1px solid var(--bg-4);border-radius:var(--radius);padding:24px;width:620px;max-height:calc(100vh - 80px);overflow-y:auto;margin-bottom:40px;">
+          <h2 id="rule-form-title" style="font-size:18px;margin-bottom:20px;color:var(--accent);">Create Rule</h2>
+          <input type="hidden" id="rf-original-name" value="">
+
+          <div style="margin-bottom:16px;">
+            <label style="display:block;font-size:11px;color:var(--text-3);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;">Rule Name</label>
+            <input id="rf-name" class="mono" style="width:100%;padding:8px 12px;background:var(--bg-1);border:1px solid var(--bg-4);border-radius:var(--radius-sm);color:var(--text);font-family:var(--mono);font-size:13px;" placeholder="my-proxy-rule">
+          </div>
+
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px;">
+            <div>
+              <label style="display:block;font-size:11px;color:var(--text-3);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;">Protocol</label>
+              <select id="rf-protocol" style="width:100%;padding:8px 12px;background:var(--bg-1);border:1px solid var(--bg-4);border-radius:var(--radius-sm);color:var(--text);font-size:13px;">
+                <option value="tcp">TCP</option>
+                <option value="udp">UDP</option>
+              </select>
+            </div>
+            <div>
+              <label style="display:block;font-size:11px;color:var(--text-3);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;">Idle Timeout (UDP, sec)</label>
+              <input id="rf-idle-timeout" type="number" style="width:100%;padding:8px 12px;background:var(--bg-1);border:1px solid var(--bg-4);border-radius:var(--radius-sm);color:var(--text);font-family:var(--mono);font-size:13px;" value="30">
+            </div>
+          </div>
+
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px;">
+            <div>
+              <label style="display:block;font-size:11px;color:var(--text-3);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;">Listen Address</label>
+              <input id="rf-listen" class="mono" style="width:100%;padding:8px 12px;background:var(--bg-1);border:1px solid var(--bg-4);border-radius:var(--radius-sm);color:var(--text);font-family:var(--mono);font-size:13px;" placeholder="0.0.0.0:8080">
+            </div>
+            <div>
+              <label style="display:block;font-size:11px;color:var(--text-3);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;">Target Address</label>
+              <input id="rf-target" class="mono" style="width:100%;padding:8px 12px;background:var(--bg-1);border:1px solid var(--bg-4);border-radius:var(--radius-sm);color:var(--text);font-family:var(--mono);font-size:13px;" placeholder="10.0.0.1:80">
+            </div>
+          </div>
+
+          <div style="margin-bottom:16px;">
+            <label style="display:block;font-size:11px;color:var(--text-3);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;">Duplicate To (optional)</label>
+            <input id="rf-duplicate" class="mono" style="width:100%;padding:8px 12px;background:var(--bg-1);border:1px solid var(--bg-4);border-radius:var(--radius-sm);color:var(--text);font-family:var(--mono);font-size:13px;" placeholder="10.0.0.2:9090">
+          </div>
+
+          <!-- FILTERS -->
+          <div style="margin-bottom:16px;">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+              <label style="font-size:11px;color:var(--text-3);text-transform:uppercase;letter-spacing:.5px;">Filters</label>
+              <button class="btn" style="font-size:11px;padding:2px 8px;" onclick="addFilterRow()">+ Add</button>
+            </div>
+            <div id="rf-filters"></div>
+          </div>
+
+          <div id="rf-error" style="color:var(--err);font-size:12px;margin-bottom:12px;display:none;"></div>
+
+          <div style="display:flex;gap:8px;justify-content:flex-end;">
+            <button class="btn" onclick="closeRuleForm()">Cancel</button>
+            <button class="btn btn-accent" onclick="saveRule()">Save & Apply</button>
+          </div>
+        </div>
+      </div>
     </div>
 
     <!-- SESSIONS -->
@@ -445,11 +507,15 @@ function renderRules(rules, stats) {
 
   document.getElementById('rules-table').innerHTML = rules.map(r => {
     const s = statsMap[r.name] || {};
-    return `<tr onclick="showRuleDetail('${esc(r.name)}');" style="cursor:pointer;">
-      <td><strong>${esc(r.name)}</strong></td>
+    return `<tr>
+      <td style="cursor:pointer;" onclick="showRuleDetail('${esc(r.name)}')"><strong>${esc(r.name)}</strong></td>
       <td><span class="badge badge-${r.protocol}">${r.protocol.toUpperCase()}</span></td>
       <td class="mono">${esc(r.listen)}</td><td class="mono">${esc(r.target)}</td>
       <td>${r.filters_count}</td><td>${r.has_duplicate?'Yes':'—'}</td><td>${r.has_exporter?'Yes':'—'}</td>
+      <td>
+        <button class="btn" style="font-size:11px;padding:2px 8px;margin-right:4px;" onclick="editRule('${esc(r.name)}')">Edit</button>
+        <button class="btn btn-danger" style="font-size:11px;padding:2px 8px;" onclick="deleteRule('${esc(r.name)}')">Del</button>
+      </td>
     </tr>`;
   }).join('');
 
@@ -537,6 +603,141 @@ function renderSystem(status) {
   document.getElementById('system-features').innerHTML = ['web'].map(f =>
     `<span class="badge badge-ok">${f}</span>`
   ).join('');
+}
+
+// RULE CRUD
+let _editingRule = null; // tracks the AppRule being loaded for editing
+
+function openRuleForm(existingRule) {
+  _editingRule = existingRule || null;
+  const overlay = document.getElementById('rule-form-overlay');
+  overlay.style.display = 'flex';
+  document.getElementById('rf-error').style.display = 'none';
+
+  if (existingRule) {
+    document.getElementById('rule-form-title').textContent = 'Edit Rule';
+    document.getElementById('rf-original-name').value = existingRule.name;
+    document.getElementById('rf-name').value = existingRule.name;
+    document.getElementById('rf-protocol').value = existingRule.protocol;
+    document.getElementById('rf-listen').value = existingRule.listen;
+    document.getElementById('rf-target').value = existingRule.target;
+    document.getElementById('rf-duplicate').value = existingRule.duplicate || '';
+    document.getElementById('rf-idle-timeout').value = existingRule.idle_timeout_secs || 30;
+    // Render existing filters
+    document.getElementById('rf-filters').innerHTML = '';
+    (existingRule.filters || []).forEach(f => addFilterRow(f));
+  } else {
+    document.getElementById('rule-form-title').textContent = 'Create Rule';
+    document.getElementById('rf-original-name').value = '';
+    document.getElementById('rf-name').value = '';
+    document.getElementById('rf-protocol').value = 'tcp';
+    document.getElementById('rf-listen').value = '';
+    document.getElementById('rf-target').value = '';
+    document.getElementById('rf-duplicate').value = '';
+    document.getElementById('rf-idle-timeout').value = '30';
+    document.getElementById('rf-filters').innerHTML = '';
+  }
+}
+
+function closeRuleForm() {
+  document.getElementById('rule-form-overlay').style.display = 'none';
+  _editingRule = null;
+}
+
+function addFilterRow(existing) {
+  const container = document.getElementById('rf-filters');
+  const row = document.createElement('div');
+  row.style.cssText = 'display:grid;grid-template-columns:100px 80px 1fr 80px 30px;gap:6px;margin-bottom:6px;align-items:center;';
+  row.innerHTML = `
+    <select class="flt-kind" style="padding:6px;background:var(--bg-1);border:1px solid var(--bg-4);border-radius:var(--radius-sm);color:var(--text);font-size:12px;">
+      <option value="substr" ${existing?.kind==='substr'?'selected':''}>substr</option>
+      <option value="bsubstr" ${existing?.kind==='bsubstr'?'selected':''}>bsubstr</option>
+      <option value="regex" ${existing?.kind==='regex'?'selected':''}>regex</option>
+    </select>
+    <select class="flt-dir" style="padding:6px;background:var(--bg-1);border:1px solid var(--bg-4);border-radius:var(--radius-sm);color:var(--text);font-size:12px;">
+      <option value="both" ${existing?.direction==='both'||!existing?.direction?'selected':''}>both</option>
+      <option value="c2s" ${existing?.direction==='c2s'?'selected':''}>c2s</option>
+      <option value="s2c" ${existing?.direction==='s2c'?'selected':''}>s2c</option>
+    </select>
+    <input class="flt-pattern" value="${esc(existing?.pattern||'')}" placeholder="pattern" style="padding:6px;background:var(--bg-1);border:1px solid var(--bg-4);border-radius:var(--radius-sm);color:var(--text);font-family:var(--mono);font-size:12px;">
+    <select class="flt-action" style="padding:6px;background:var(--bg-1);border:1px solid var(--bg-4);border-radius:var(--radius-sm);color:var(--text);font-size:12px;">
+      <option value="drop" ${existing?.action==='drop'?'selected':''}>drop</option>
+      <option value="pass" ${existing?.action==='pass'||!existing?.action?'selected':''}>pass</option>
+      <option value="tap-only" ${existing?.action==='tap-only'?'selected':''}>tap-only</option>
+    </select>
+    <button onclick="this.parentElement.remove()" style="background:none;border:none;color:var(--err);cursor:pointer;font-size:16px;">×</button>
+  `;
+  container.appendChild(row);
+}
+
+function collectFilters() {
+  const rows = document.querySelectorAll('#rf-filters > div');
+  return Array.from(rows).map(row => ({
+    kind: row.querySelector('.flt-kind').value,
+    pattern: row.querySelector('.flt-pattern').value,
+    direction: row.querySelector('.flt-dir').value,
+    action: row.querySelector('.flt-action').value,
+  })).filter(f => f.pattern.trim() !== '');
+}
+
+async function saveRule() {
+  const name = document.getElementById('rf-name').value.trim();
+  const protocol = document.getElementById('rf-protocol').value;
+  const listen = document.getElementById('rf-listen').value.trim();
+  const target = document.getElementById('rf-target').value.trim();
+  const duplicate = document.getElementById('rf-duplicate').value.trim() || null;
+  const idle = parseInt(document.getElementById('rf-idle-timeout').value) || 30;
+  const filters = collectFilters();
+  const originalName = document.getElementById('rf-original-name').value;
+
+  if (!name || !listen || !target) {
+    document.getElementById('rf-error').textContent = 'Name, listen, and target are required';
+    document.getElementById('rf-error').style.display = 'block';
+    return;
+  }
+
+  const rule = { name, protocol, listen, target, filters, duplicate, idle_timeout_secs: idle };
+
+  try {
+    let r;
+    if (originalName) {
+      r = await api('/api/rules/update', { method:'POST', body:JSON.stringify({ original_name:originalName, rule }) });
+    } else {
+      r = await api('/api/rules/create', { method:'POST', body:JSON.stringify(rule) });
+    }
+    const data = await r.json();
+    if (data.ok) {
+      toast(originalName ? 'Rule updated' : 'Rule created');
+      closeRuleForm();
+      refreshAll();
+    } else {
+      document.getElementById('rf-error').textContent = data.error || 'Unknown error';
+      document.getElementById('rf-error').style.display = 'block';
+    }
+  } catch(e) {
+    document.getElementById('rf-error').textContent = 'Request failed: ' + e.message;
+    document.getElementById('rf-error').style.display = 'block';
+  }
+}
+
+async function editRule(name) {
+  try {
+    const r = await api('/api/rules/full');
+    const fullRules = await r.json();
+    const rule = fullRules.find(x => x.name === name);
+    if (!rule) { toast('Rule not found', 'err'); return; }
+    openRuleForm(rule);
+  } catch(e) { toast('Failed to load rule: ' + e.message, 'err'); }
+}
+
+async function deleteRule(name) {
+  if (!confirm(`Delete rule "${name}"? This will save to config and restart the engine.`)) return;
+  try {
+    const r = await api('/api/rules/delete', { method:'POST', body:JSON.stringify({ name }) });
+    const data = await r.json();
+    if (data.ok) { toast('Rule deleted'); refreshAll(); }
+    else { toast(data.error || 'Delete failed', 'err'); }
+  } catch(e) { toast('Delete failed: ' + e.message, 'err'); }
 }
 
 // ACTIONS
