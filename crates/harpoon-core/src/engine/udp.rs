@@ -39,7 +39,7 @@ pub async fn run_udp_pipeline(
         params.name, params.listen_addr, params.target_addr,
         params.filters, params.duplicate_addr,
         params.udp_source_mode, params.idle_timeout_secs,
-        params.max_datagram, stats, event_tx, export_tx, cancel,
+        params.max_datagram, params.capture, stats, event_tx, export_tx, cancel,
     ).await
 }
 
@@ -57,7 +57,8 @@ pub async fn run_udp_rule(
         rule.name.clone(), rule.listen.addr, rule.target.addr,
         filters, rule.duplicate.as_ref().map(|d| d.endpoint.addr),
         rule.udp_source_mode.clone(), rule.idle_timeout_secs,
-        max_datagram, stats, event_tx, export_tx, cancel,
+        max_datagram, crate::capture::CaptureManager::new(),
+        stats, event_tx, export_tx, cancel,
     ).await
 }
 
@@ -71,6 +72,7 @@ async fn run_udp_inner(
     source_mode: UdpSourceMode,
     idle_timeout_secs: u64,
     max_datagram: usize,
+    _capture: Arc<crate::capture::CaptureManager>,
     stats: Arc<RuleStats>,
     event_tx: broadcast::Sender<Event>,
     export_tx: Option<mpsc::Sender<Event>>,

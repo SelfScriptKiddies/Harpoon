@@ -5,6 +5,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::capture::CaptureManager;
 use crate::engine::filter::CompiledFilter;
 use crate::error::HarpoonError;
 use crate::export::sink::run_exporter;
@@ -26,6 +27,7 @@ pub struct TcpParams {
     pub duplicate_addr: Option<SocketAddr>,
     pub buffer_size: usize,
     pub tcp_nodelay: bool,
+    pub capture: Arc<CaptureManager>,
     #[cfg(feature = "tls")]
     pub ca: Option<Arc<CertAuthority>>,
     #[cfg(feature = "tls")]
@@ -41,6 +43,7 @@ pub struct UdpParams {
     pub target_addr: SocketAddr,
     pub filters: Arc<Vec<CompiledFilter>>,
     pub duplicate_addr: Option<SocketAddr>,
+    pub capture: Arc<CaptureManager>,
     pub udp_source_mode: UdpSourceMode,
     pub idle_timeout_secs: u64,
     pub max_datagram: usize,
@@ -56,27 +59,28 @@ pub fn spawn_plan(
     max_datagram: usize,
     tcp_nodelay: bool,
     export_channel_capacity: usize,
+    capture: Arc<CaptureManager>,
     #[cfg(feature = "tls")] ca: Option<Arc<CertAuthority>>,
 ) -> JoinHandle<Result<(), HarpoonError>> {
     match plan {
         ExecutionPlan::FastForward(p) => {
             spawn_fast_forward(
                 p, stats, event_tx, cancel, buffer_size, max_datagram,
-                tcp_nodelay, export_channel_capacity,
+                tcp_nodelay, export_channel_capacity, capture,
                 #[cfg(feature = "tls")] ca,
             )
         }
         ExecutionPlan::Linear(p) => {
             spawn_linear(
                 p, stats, event_tx, cancel, buffer_size, max_datagram,
-                tcp_nodelay, export_channel_capacity,
+                tcp_nodelay, export_channel_capacity, capture,
                 #[cfg(feature = "tls")] ca,
             )
         }
         ExecutionPlan::Dag(p) => {
             spawn_dag(
                 p, stats, event_tx, cancel, buffer_size, max_datagram,
-                tcp_nodelay, export_channel_capacity,
+                tcp_nodelay, export_channel_capacity, capture,
                 #[cfg(feature = "tls")] ca,
             )
         }
@@ -92,6 +96,7 @@ fn spawn_fast_forward(
     max_datagram: usize,
     tcp_nodelay: bool,
     _export_channel_capacity: usize,
+    capture: Arc<CaptureManager>,
     #[cfg(feature = "tls")] _ca: Option<Arc<CertAuthority>>,
 ) -> JoinHandle<Result<(), HarpoonError>> {
     let proto = plan.source.endpoint.protocol;
@@ -105,6 +110,7 @@ fn spawn_fast_forward(
                 duplicate_addr: None,
                 buffer_size,
                 tcp_nodelay,
+                capture: capture.clone(),
                 #[cfg(feature = "tls")] ca: None,
                 #[cfg(feature = "tls")] tls_terminate: false,
                 #[cfg(feature = "tls")] tls_initiate: false,
@@ -120,6 +126,7 @@ fn spawn_fast_forward(
                 target_addr: plan.forward.endpoint.addr,
                 filters: Arc::new(vec![]),
                 duplicate_addr: None,
+                capture: capture.clone(),
                 udp_source_mode: plan.source.udp_source_mode,
                 idle_timeout_secs: plan.source.idle_timeout_secs,
                 max_datagram,
@@ -140,6 +147,7 @@ fn spawn_linear(
     max_datagram: usize,
     tcp_nodelay: bool,
     export_channel_capacity: usize,
+    capture: Arc<CaptureManager>,
     #[cfg(feature = "tls")] ca: Option<Arc<CertAuthority>>,
 ) -> JoinHandle<Result<(), HarpoonError>> {
     // Compile filters
@@ -169,6 +177,7 @@ fn spawn_linear(
                 duplicate_addr: dup_addr,
                 buffer_size,
                 tcp_nodelay,
+                capture: capture.clone(),
                 #[cfg(feature = "tls")]
                 ca,
                 #[cfg(feature = "tls")]
@@ -187,6 +196,7 @@ fn spawn_linear(
                 target_addr: plan.forward.endpoint.addr,
                 filters: Arc::new(filters),
                 duplicate_addr: dup_addr,
+                capture: capture.clone(),
                 udp_source_mode: plan.source.udp_source_mode,
                 idle_timeout_secs: plan.source.idle_timeout_secs,
                 max_datagram,
@@ -207,6 +217,7 @@ fn spawn_dag(
     max_datagram: usize,
     tcp_nodelay: bool,
     export_channel_capacity: usize,
+    capture: Arc<CaptureManager>,
     #[cfg(feature = "tls")] ca: Option<Arc<CertAuthority>>,
 ) -> JoinHandle<Result<(), HarpoonError>> {
     // DAG executor: for now, extract linear components and run as linear.
@@ -258,6 +269,7 @@ fn spawn_dag(
                 duplicate_addr: dup_addr,
                 buffer_size,
                 tcp_nodelay,
+                capture: capture.clone(),
                 #[cfg(feature = "tls")] ca,
                 #[cfg(feature = "tls")] tls_terminate: false,
                 #[cfg(feature = "tls")] tls_initiate: false,
@@ -273,6 +285,7 @@ fn spawn_dag(
                 target_addr: fwd.endpoint.addr,
                 filters: Arc::new(filters),
                 duplicate_addr: dup_addr,
+                capture: capture.clone(),
                 udp_source_mode: plan.source.udp_source_mode,
                 idle_timeout_secs: plan.source.idle_timeout_secs,
                 max_datagram,

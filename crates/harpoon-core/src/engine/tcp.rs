@@ -42,6 +42,7 @@ pub async fn run_tcp_pipeline(
     let name = Arc::new(params.name);
     let dup_endpoint = params.duplicate_addr;
     let filters = params.filters;
+    let capture = params.capture;
     let buffer_size = params.buffer_size;
     let tcp_nodelay = params.tcp_nodelay;
 
@@ -76,6 +77,7 @@ pub async fn run_tcp_pipeline(
                 let export_tx = export_tx.clone();
                 let cancel = cancel.child_token();
                 let name = name.clone();
+                let capture = capture.clone();
 
                 #[cfg(feature = "tls")]
                 let ca = ca.clone();
@@ -105,7 +107,7 @@ pub async fn run_tcp_pipeline(
                                     client_stream, client_addr, target_addr,
                                     dup_endpoint, &filters, &stats,
                                     &event_tx, &export_tx, &cancel,
-                                    buffer_size, tcp_nodelay, &name,
+                                    buffer_size, tcp_nodelay, &name, &capture,
                                 ).await
                             }
                         }
@@ -115,7 +117,7 @@ pub async fn run_tcp_pipeline(
                                 client_stream, client_addr, target_addr,
                                 dup_endpoint, &filters, &stats,
                                 &event_tx, &export_tx, &cancel,
-                                buffer_size, tcp_nodelay, &name,
+                                buffer_size, tcp_nodelay, &name, &capture,
                             ).await
                         }
                     };
@@ -160,6 +162,7 @@ pub async fn run_tcp_rule(
         duplicate_addr: rule.duplicate.as_ref().map(|d| d.endpoint.addr),
         buffer_size,
         tcp_nodelay,
+        capture: crate::capture::CaptureManager::new(),
         #[cfg(feature = "tls")]
         ca,
         #[cfg(feature = "tls")]
@@ -184,6 +187,7 @@ async fn handle_tcp_connection(
     buffer_size: usize,
     tcp_nodelay: bool,
     rule_name: &str,
+    capture: &Arc<crate::capture::CaptureManager>,
 ) -> Result<(), HarpoonError> {
     let upstream = TcpStream::connect(target_addr)
         .await
@@ -260,6 +264,9 @@ async fn handle_tcp_connection(
                         stats.bytes_client_to_server.fetch_add(n as u64, Ordering::Relaxed);
                         stats.packets_client_to_server.fetch_add(1, Ordering::Relaxed);
 
+                        // Capture if active
+                        capture.record(&rule_name, crate::capture::PacketDirection::ClientToServer, client_addr, target_addr, data).await;
+
                         if let Some(ref mut dup) = dup_stream {
                             let _ = dup.write_all(data).await;
                         }
@@ -314,6 +321,8 @@ async fn handle_tcp_connection(
                         client_write.write_all(data).await?;
                         stats.bytes_server_to_client.fetch_add(n as u64, Ordering::Relaxed);
                         stats.packets_server_to_client.fetch_add(1, Ordering::Relaxed);
+
+                        capture.record(&rule_name, crate::capture::PacketDirection::ServerToClient, target_addr, client_addr, data).await;
                     }
                     _ = cancel.cancelled() => break,
                 }

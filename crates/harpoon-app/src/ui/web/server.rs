@@ -20,18 +20,21 @@ pub struct WebState {
     pub control: Arc<RwLock<ControlState>>,
     pub password: String,
     pub tokens: Mutex<HashSet<String>>,
+    pub capture: Arc<harpoon_core::capture::CaptureManager>,
 }
 
 pub async fn run_web_server(
     bind_addr: std::net::SocketAddr,
     control: Arc<RwLock<ControlState>>,
     password: String,
+    capture: Arc<harpoon_core::capture::CaptureManager>,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     let state = Arc::new(WebState {
         control,
         password,
         tokens: Mutex::new(HashSet::new()),
+        capture,
     });
 
     let app = Router::new()
@@ -56,6 +59,11 @@ pub async fn run_web_server(
         .route("/api/nft/preview", get(api_nft_preview))
         .route("/api/nft/apply", post(api_nft_apply))
         .route("/api/nft/rollback", post(api_nft_rollback))
+        .route("/api/capture/start", post(api_capture_start))
+        .route("/api/capture/stop", post(api_capture_stop))
+        .route("/api/capture/packets", get(api_capture_packets))
+        .route("/api/capture/sessions", get(api_capture_sessions))
+        .route("/api/capture/ws", get(api_capture_ws))
         .route("/api/reload", post(api_reload))
         .route("/api/stop", post(api_stop))
         // Static files
@@ -584,4 +592,132 @@ where
     }
 
     Ok(Json(serde_json::json!({"ok": true})))
+}
+
+// --- Capture API ---
+
+#[derive(serde::Deserialize)]
+struct CaptureStartReq {
+    rule: String,
+    #[serde(default = "default_max_packets")]
+    max_packets: usize,
+    #[serde(default = "default_max_payload")]
+    max_payload_size: usize,
+    #[serde(default = "default_timeout")]
+    timeout_secs: u64,
+}
+fn default_max_packets() -> usize { 1000 }
+fn default_max_payload() -> usize { 4096 }
+fn default_timeout() -> u64 { 300 }
+
+async fn api_capture_start(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+    Json(req): Json<CaptureStartReq>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_auth!(state, headers);
+    match state.capture.start(req.rule, req.max_packets, req.max_payload_size, req.timeout_secs).await {
+        Ok(()) => Ok(Json(serde_json::json!({"ok": true}))),
+        Err(e) => Ok(Json(serde_json::json!({"ok": false, "error": e}))),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct CaptureStopReq { rule: String }
+
+async fn api_capture_stop(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+    Json(req): Json<CaptureStopReq>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_auth!(state, headers);
+    match state.capture.stop(&req.rule).await {
+        Ok(packets) => Ok(Json(serde_json::json!({"ok": true, "packets_captured": packets.len()}))),
+        Err(e) => Ok(Json(serde_json::json!({"ok": false, "error": e}))),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct CapturePacketsQuery {
+    rule: String,
+    #[serde(default)]
+    offset: usize,
+    #[serde(default = "default_limit")]
+    limit: usize,
+}
+fn default_limit() -> usize { 100 }
+
+async fn api_capture_packets(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<CapturePacketsQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_auth!(state, headers);
+    let packets = state.capture.get_packets(&q.rule, q.offset, q.limit).await;
+    let json_packets: Vec<serde_json::Value> = packets.iter().map(|p| {
+        serde_json::json!({
+            "timestamp_ms": p.timestamp_ms,
+            "rule": p.rule_name,
+            "direction": p.direction.as_str(),
+            "src": p.src.to_string(),
+            "dst": p.dst.to_string(),
+            "payload_len": p.payload_len,
+            "payload_hex": hex_encode(&p.payload),
+            "payload_text": String::from_utf8_lossy(&p.payload),
+        })
+    }).collect();
+    Ok(Json(serde_json::json!({ "packets": json_packets })))
+}
+
+async fn api_capture_sessions(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_auth!(state, headers);
+    let sessions = state.capture.list_sessions().await;
+    let json: Vec<serde_json::Value> = sessions.iter().map(|s| {
+        serde_json::json!({
+            "rule": s.rule_name,
+            "packets_captured": s.packets_captured,
+            "max_packets": s.max_packets,
+            "elapsed_secs": s.elapsed_secs,
+            "timeout_secs": s.timeout_secs,
+        })
+    }).collect();
+    Ok(Json(serde_json::json!({ "sessions": json })))
+}
+
+async fn api_capture_ws(
+    State(state): State<Arc<WebState>>,
+    ws: axum::extract::WebSocketUpgrade,
+) -> impl IntoResponse {
+    let capture = state.capture.clone();
+    ws.on_upgrade(move |mut socket| async move {
+        let mut rx = capture.subscribe();
+        loop {
+            match rx.recv().await {
+                Ok(packet) => {
+                    let msg = serde_json::json!({
+                        "timestamp_ms": packet.timestamp_ms,
+                        "rule": packet.rule_name,
+                        "direction": packet.direction.as_str(),
+                        "src": packet.src.to_string(),
+                        "dst": packet.dst.to_string(),
+                        "payload_len": packet.payload_len,
+                        "payload_hex": hex_encode(&packet.payload),
+                        "payload_text": String::from_utf8_lossy(&packet.payload),
+                    });
+                    if socket.send(axum::extract::ws::Message::Text(msg.to_string().into())).await.is_err() {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
+}
+
+fn hex_encode(data: &[u8]) -> String {
+    data.iter().map(|b| format!("{:02x}", b)).collect()
 }

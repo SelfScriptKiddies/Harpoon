@@ -27,6 +27,7 @@ pub struct EngineHandle {
     event_tx: broadcast::Sender<Event>,
     stats: Vec<(String, Arc<RuleStats>)>,
     join_handles: Vec<JoinHandle<Result<(), HarpoonError>>>,
+    capture: Arc<crate::capture::CaptureManager>,
 }
 
 impl EngineHandle {
@@ -61,9 +62,20 @@ impl EngineHandle {
     pub fn subscribe_events(&self) -> broadcast::Receiver<Event> {
         self.event_tx.subscribe()
     }
+
+    pub fn capture_manager(&self) -> &Arc<crate::capture::CaptureManager> {
+        &self.capture
+    }
 }
 
 pub async fn run(config: CoreConfig) -> Result<EngineHandle, HarpoonError> {
+    run_with_capture(config, crate::capture::CaptureManager::new()).await
+}
+
+pub async fn run_with_capture(
+    config: CoreConfig,
+    capture: std::sync::Arc<crate::capture::CaptureManager>,
+) -> Result<EngineHandle, HarpoonError> {
     let cancel = CancellationToken::new();
     let (event_tx, _) = broadcast::channel(config.event_channel_capacity);
     let mut handles: Vec<JoinHandle<Result<(), HarpoonError>>> = Vec::new();
@@ -106,6 +118,7 @@ pub async fn run(config: CoreConfig) -> Result<EngineHandle, HarpoonError> {
             config.udp_max_datagram,
             config.tcp_nodelay,
             config.export_channel_capacity,
+            capture.clone(),
             #[cfg(feature = "tls")]
             ca.clone(),
         );
@@ -117,6 +130,7 @@ pub async fn run(config: CoreConfig) -> Result<EngineHandle, HarpoonError> {
         event_tx,
         stats: stats_vec,
         join_handles: handles,
+        capture,
     })
 }
 

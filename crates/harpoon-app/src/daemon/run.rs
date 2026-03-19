@@ -57,7 +57,8 @@ async fn run_engine_loop(config_path: PathBuf, socket_path: &std::path::Path) ->
 
     tracing::info!(rules = core_config.rules.len(), "starting harpoon engine");
 
-    let engine_handle = harpoon_core::run(core_config)
+    let capture = harpoon_core::capture::CaptureManager::new();
+    let engine_handle = harpoon_core::engine::run_with_capture(core_config, capture.clone())
         .await
         .context("starting engine")?;
 
@@ -96,9 +97,10 @@ async fn run_engine_loop(config_path: PathBuf, socket_path: &std::path::Path) ->
             generated
         });
         let web_state = control_state.clone();
+        let web_capture = capture.clone();
         let web_cancel = cancel.child_token();
         tokio::spawn(async move {
-            if let Err(e) = crate::ui::web::server::run_web_server(web_addr, web_state, web_password, web_cancel).await {
+            if let Err(e) = crate::ui::web::server::run_web_server(web_addr, web_state, web_password, web_capture, web_cancel).await {
                 tracing::error!(error = %e, "web server error");
             }
         });
