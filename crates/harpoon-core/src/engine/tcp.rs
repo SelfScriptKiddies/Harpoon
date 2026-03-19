@@ -6,53 +6,51 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
+use crate::engine::executor::TcpParams;
 use crate::engine::filter::{apply_filters, CompiledFilter};
 use crate::error::HarpoonError;
 use crate::types::event::{Event, EventKind};
 use crate::types::filter::{Direction, FilterAction};
-use crate::types::rule::{Rule, TlsMode};
+use crate::types::rule::Rule;
 use crate::types::stats::RuleStats;
 
 #[cfg(feature = "tls")]
 use crate::tls::cert::CertAuthority;
 
-pub async fn run_tcp_rule(
-    rule: Rule,
+/// Pipeline-based TCP executor. Accepts parameterized config.
+pub async fn run_tcp_pipeline(
+    params: TcpParams,
     stats: Arc<RuleStats>,
-    filters: Arc<Vec<CompiledFilter>>,
     event_tx: broadcast::Sender<Event>,
     export_tx: Option<mpsc::Sender<Event>>,
     cancel: CancellationToken,
-    buffer_size: usize,
-    tcp_nodelay: bool,
-    #[cfg(feature = "tls")] ca: Option<Arc<CertAuthority>>,
 ) -> Result<(), HarpoonError> {
-    let listener = TcpListener::bind(rule.listen.addr)
+    let listener = TcpListener::bind(params.listen_addr)
         .await
         .map_err(|e| HarpoonError::Bind {
-            addr: rule.listen.addr,
+            addr: params.listen_addr,
             source: e,
         })?;
 
-    tracing::info!(rule = %rule.name, listen = %rule.listen, target = %rule.target, "tcp rule started");
+    tracing::info!(pipeline = %params.name, listen = %params.listen_addr, target = %params.target_addr, "tcp pipeline started");
     emit_event(
-        &event_tx,
-        &export_tx,
-        &stats,
-        EventKind::RuleActivated {
-            rule: rule.name.clone(),
-        },
-    )
-    .await;
+        &event_tx, &export_tx, &stats,
+        EventKind::RuleActivated { rule: params.name.clone() },
+    ).await;
 
-    let target_addr = rule.target.addr;
-    let rule_name = Arc::new(rule.name.clone());
-    let dup_endpoint = rule.duplicate.as_ref().map(|d| d.endpoint.addr);
+    let target_addr = params.target_addr;
+    let name = Arc::new(params.name);
+    let dup_endpoint = params.duplicate_addr;
+    let filters = params.filters;
+    let buffer_size = params.buffer_size;
+    let tcp_nodelay = params.tcp_nodelay;
 
     #[cfg(feature = "tls")]
-    let tls_mode = rule.tls.as_ref().map(|t| t.mode.clone());
-    #[cfg(not(feature = "tls"))]
-    let _tls_mode: Option<TlsMode> = None;
+    let ca = params.ca;
+    #[cfg(feature = "tls")]
+    let tls_terminate = params.tls_terminate;
+    #[cfg(feature = "tls")]
+    let tls_initiate = params.tls_initiate;
 
     loop {
         tokio::select! {
@@ -65,13 +63,11 @@ pub async fn run_tcp_rule(
                     }
                 };
 
-                // Apply TCP_NODELAY
                 let _ = client_stream.set_nodelay(tcp_nodelay);
 
                 stats.active_tcp_connections.fetch_add(1, Ordering::Relaxed);
                 emit_event(&event_tx, &export_tx, &stats, EventKind::TcpConnectionOpened {
-                    rule: rule_name.to_string(),
-                    client: client_addr,
+                    rule: name.to_string(), client: client_addr,
                 }).await;
 
                 let stats = stats.clone();
@@ -79,38 +75,38 @@ pub async fn run_tcp_rule(
                 let event_tx = event_tx.clone();
                 let export_tx = export_tx.clone();
                 let cancel = cancel.child_token();
-                let rule_name = rule_name.clone();
+                let name = name.clone();
 
                 #[cfg(feature = "tls")]
                 let ca = ca.clone();
-                #[cfg(feature = "tls")]
-                let tls_mode = tls_mode.clone();
 
                 tokio::spawn(async move {
                     let result = {
                         #[cfg(feature = "tls")]
                         {
-                            match &tls_mode {
-                                Some(mode) if !matches!(mode, TlsMode::Passthrough) => {
-                                    if let Some(ref ca) = ca {
-                                        crate::tls::mitm::handle_tls_connection(
-                                            client_stream, client_addr, target_addr,
-                                            mode, ca, &filters, &stats,
-                                            &event_tx, &export_tx, &cancel,
-                                            buffer_size, &rule_name,
-                                        ).await
+                            if tls_terminate {
+                                if let Some(ref ca) = ca {
+                                    let mode = if tls_initiate {
+                                        crate::types::rule::TlsMode::Mitm
                                     } else {
-                                        Err(HarpoonError::Config("TLS mode requires CA certificate".into()))
-                                    }
-                                }
-                                _ => {
-                                    handle_tcp_connection(
+                                        crate::types::rule::TlsMode::Terminate
+                                    };
+                                    crate::tls::mitm::handle_tls_connection(
                                         client_stream, client_addr, target_addr,
-                                        dup_endpoint, &filters, &stats,
+                                        &mode, ca, &filters, &stats,
                                         &event_tx, &export_tx, &cancel,
-                                        buffer_size, tcp_nodelay, &rule_name,
+                                        buffer_size, &name,
                                     ).await
+                                } else {
+                                    Err(HarpoonError::Config("TLS mode requires CA certificate".into()))
                                 }
+                            } else {
+                                handle_tcp_connection(
+                                    client_stream, client_addr, target_addr,
+                                    dup_endpoint, &filters, &stats,
+                                    &event_tx, &export_tx, &cancel,
+                                    buffer_size, tcp_nodelay, &name,
+                                ).await
                             }
                         }
                         #[cfg(not(feature = "tls"))]
@@ -119,30 +115,59 @@ pub async fn run_tcp_rule(
                                 client_stream, client_addr, target_addr,
                                 dup_endpoint, &filters, &stats,
                                 &event_tx, &export_tx, &cancel,
-                                buffer_size, tcp_nodelay, &rule_name,
+                                buffer_size, tcp_nodelay, &name,
                             ).await
                         }
                     };
 
                     if let Err(e) = result {
-                        tracing::debug!(rule = %rule_name, error = %e, "tcp connection ended");
+                        tracing::debug!(pipeline = %name, error = %e, "tcp connection ended");
                     }
 
                     stats.active_tcp_connections.fetch_sub(1, Ordering::Relaxed);
                     let _ = event_tx.send(Event::new(EventKind::TcpConnectionClosed {
-                        rule: rule_name.to_string(),
-                        client: client_addr,
+                        rule: name.to_string(), client: client_addr,
                     }));
                 });
             }
             _ = cancel.cancelled() => {
-                tracing::info!(rule = %rule_name, "tcp rule shutting down");
+                tracing::info!(pipeline = %name, "tcp pipeline shutting down");
                 break;
             }
         }
     }
 
     Ok(())
+}
+
+/// Backward-compat wrapper: runs a Rule as a TCP pipeline.
+pub async fn run_tcp_rule(
+    rule: Rule,
+    stats: Arc<RuleStats>,
+    filters: Arc<Vec<CompiledFilter>>,
+    event_tx: broadcast::Sender<Event>,
+    export_tx: Option<mpsc::Sender<Event>>,
+    cancel: CancellationToken,
+    buffer_size: usize,
+    tcp_nodelay: bool,
+    #[cfg(feature = "tls")] ca: Option<Arc<CertAuthority>>,
+) -> Result<(), HarpoonError> {
+    let params = TcpParams {
+        name: rule.name.clone(),
+        listen_addr: rule.listen.addr,
+        target_addr: rule.target.addr,
+        filters,
+        duplicate_addr: rule.duplicate.as_ref().map(|d| d.endpoint.addr),
+        buffer_size,
+        tcp_nodelay,
+        #[cfg(feature = "tls")]
+        ca,
+        #[cfg(feature = "tls")]
+        tls_terminate: rule.tls.as_ref().map(|t| !matches!(t.mode, crate::types::rule::TlsMode::Passthrough)).unwrap_or(false),
+        #[cfg(feature = "tls")]
+        tls_initiate: rule.tls.as_ref().map(|t| matches!(t.mode, crate::types::rule::TlsMode::Mitm)).unwrap_or(false),
+    };
+    run_tcp_pipeline(params, stats, event_tx, export_tx, cancel).await
 }
 
 #[allow(clippy::too_many_arguments)]

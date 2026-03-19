@@ -324,3 +324,167 @@ async fn test_tcp_proxy_stats() {
     handle.stop();
     handle.shutdown().await;
 }
+
+// ── Pipeline-native tests ──
+
+use harpoon_core::types::pipeline::*;
+use harpoon_core::types::rule::UdpSourceMode;
+
+#[tokio::test]
+async fn test_pipeline_fast_forward_tcp() {
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo_listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = echo_listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                loop {
+                    let n = stream.read(&mut buf).await.unwrap();
+                    if n == 0 { break; }
+                    stream.write_all(&buf[..n]).await.unwrap();
+                }
+            });
+        }
+    });
+
+    let tmp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = tmp.local_addr().unwrap();
+    drop(tmp);
+
+    let pipeline = Pipeline {
+        id: "pipe-ff".into(),
+        name: "pipe-ff".into(),
+        nodes: vec![
+            Node {
+                id: 1,
+                label: "source".into(),
+                kind: NodeKind::Source(SourceConfig {
+                    endpoint: Endpoint::tcp(proxy_addr),
+                    udp_source_mode: UdpSourceMode::Proxy,
+                    idle_timeout_secs: 30,
+                }),
+            },
+            Node {
+                id: 2,
+                label: "forward".into(),
+                kind: NodeKind::Forward(ForwardConfig {
+                    endpoint: Endpoint::tcp(echo_addr),
+                    tcp_nodelay: true,
+                }),
+            },
+        ],
+        edges: vec![Edge { id: 1, from_node: 1, to_node: 2, from_port: None }],
+    };
+
+    let config = CoreConfig {
+        pipelines: vec![pipeline],
+        ..CoreConfig::default()
+    };
+
+    let handle = harpoon_core::run(config).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    {
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        client.write_all(b"pipeline test").await.unwrap();
+        let mut buf = [0u8; 64];
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"pipeline test");
+    }
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let stats = handle.stats_snapshot();
+    assert_eq!(stats[0].bytes_client_to_server, 13);
+
+    handle.stop();
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_pipeline_linear_with_filter() {
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo_listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = echo_listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                loop {
+                    let n = stream.read(&mut buf).await.unwrap();
+                    if n == 0 { break; }
+                    stream.write_all(&buf[..n]).await.unwrap();
+                }
+            });
+        }
+    });
+
+    let tmp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = tmp.local_addr().unwrap();
+    drop(tmp);
+
+    let pipeline = Pipeline {
+        id: "pipe-lin".into(),
+        name: "pipe-lin".into(),
+        nodes: vec![
+            Node {
+                id: 1,
+                label: "source".into(),
+                kind: NodeKind::Source(SourceConfig {
+                    endpoint: Endpoint::tcp(proxy_addr),
+                    udp_source_mode: UdpSourceMode::Proxy,
+                    idle_timeout_secs: 30,
+                }),
+            },
+            Node {
+                id: 2,
+                label: "filter".into(),
+                kind: NodeKind::Filter(FilterNodeConfig {
+                    filters: vec![Filter {
+                        kind: FilterKind::Substr("blocked".into()),
+                        direction: Direction::ClientToServer,
+                        action_on_match: FilterAction::Drop,
+                    }],
+                }),
+            },
+            Node {
+                id: 3,
+                label: "forward".into(),
+                kind: NodeKind::Forward(ForwardConfig {
+                    endpoint: Endpoint::tcp(echo_addr),
+                    tcp_nodelay: true,
+                }),
+            },
+        ],
+        edges: vec![
+            Edge { id: 1, from_node: 1, to_node: 2, from_port: None },
+            Edge { id: 2, from_node: 2, to_node: 3, from_port: None },
+        ],
+    };
+
+    let config = CoreConfig {
+        pipelines: vec![pipeline],
+        ..CoreConfig::default()
+    };
+
+    let handle = harpoon_core::run(config).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    client.write_all(b"this is blocked data").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    client.write_all(b"hello pipe").await.unwrap();
+
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf))
+        .await.expect("timeout").unwrap();
+    assert_eq!(&buf[..n], b"hello pipe");
+
+    let stats = handle.stats_snapshot();
+    assert_eq!(stats[0].dropped_packets, 1);
+
+    handle.stop();
+    handle.shutdown().await;
+}

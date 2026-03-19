@@ -8,6 +8,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
+use crate::engine::executor::UdpParams;
 use crate::engine::filter::{apply_filters, CompiledFilter};
 use crate::error::HarpoonError;
 use crate::types::event::{Event, EventKind};
@@ -26,6 +27,23 @@ struct UdpSession {
     cancel: CancellationToken,
 }
 
+/// Pipeline-based UDP executor.
+pub async fn run_udp_pipeline(
+    params: UdpParams,
+    stats: Arc<RuleStats>,
+    event_tx: broadcast::Sender<Event>,
+    export_tx: Option<mpsc::Sender<Event>>,
+    cancel: CancellationToken,
+) -> Result<(), HarpoonError> {
+    run_udp_inner(
+        params.name, params.listen_addr, params.target_addr,
+        params.filters, params.duplicate_addr,
+        params.udp_source_mode, params.idle_timeout_secs,
+        params.max_datagram, stats, event_tx, export_tx, cancel,
+    ).await
+}
+
+/// Backward-compat wrapper.
 pub async fn run_udp_rule(
     rule: Rule,
     stats: Arc<RuleStats>,
@@ -35,31 +53,51 @@ pub async fn run_udp_rule(
     cancel: CancellationToken,
     max_datagram: usize,
 ) -> Result<(), HarpoonError> {
+    run_udp_inner(
+        rule.name.clone(), rule.listen.addr, rule.target.addr,
+        filters, rule.duplicate.as_ref().map(|d| d.endpoint.addr),
+        rule.udp_source_mode.clone(), rule.idle_timeout_secs,
+        max_datagram, stats, event_tx, export_tx, cancel,
+    ).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_udp_inner(
+    name: String,
+    listen_addr: SocketAddr,
+    target_addr: SocketAddr,
+    filters: Arc<Vec<CompiledFilter>>,
+    dup_endpoint: Option<SocketAddr>,
+    source_mode: UdpSourceMode,
+    idle_timeout_secs: u64,
+    max_datagram: usize,
+    stats: Arc<RuleStats>,
+    event_tx: broadcast::Sender<Event>,
+    export_tx: Option<mpsc::Sender<Event>>,
+    cancel: CancellationToken,
+) -> Result<(), HarpoonError> {
     let listener = Arc::new(
-        UdpSocket::bind(rule.listen.addr)
+        UdpSocket::bind(listen_addr)
             .await
             .map_err(|e| HarpoonError::Bind {
-                addr: rule.listen.addr,
+                addr: listen_addr,
                 source: e,
             })?,
     );
 
-    tracing::info!(rule = %rule.name, listen = %rule.listen, target = %rule.target, "udp rule started");
+    tracing::info!(pipeline = %name, listen = %listen_addr, target = %target_addr, "udp pipeline started");
     emit_event(
         &event_tx,
         &export_tx,
         &stats,
         EventKind::RuleActivated {
-            rule: rule.name.clone(),
+            rule: name.clone(),
         },
     )
     .await;
 
-    let target_addr = rule.target.addr;
-    let rule_name = Arc::new(rule.name.clone());
-    let idle_timeout = std::time::Duration::from_secs(rule.idle_timeout_secs);
-    let dup_endpoint = rule.duplicate.as_ref().map(|d| d.endpoint.addr);
-    let source_mode = rule.udp_source_mode.clone();
+    let rule_name = Arc::new(name);
+    let idle_timeout = std::time::Duration::from_secs(idle_timeout_secs);
 
     // Pre-create persistent duplicate socket
     let dup_socket = if let Some(dup_addr) = dup_endpoint {
