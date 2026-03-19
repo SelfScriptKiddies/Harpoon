@@ -68,3 +68,38 @@ export async function reload() { return (await api('/api/reload', { method: 'POS
 export async function stop() { return (await api('/api/stop', { method: 'POST' })).json(); }
 export async function applyNft() { return (await api('/api/nft/apply', { method: 'POST' })).json(); }
 export async function rollbackNft() { return (await api('/api/nft/rollback', { method: 'POST' })).json(); }
+
+// Capture API
+export async function startCapture(rule, opts = {}) {
+  return (await api('/api/capture/start', {
+    method: 'POST',
+    body: JSON.stringify({ rule, max_packets: opts.maxPackets || 1000, max_payload_size: opts.maxPayload || 4096, timeout_secs: opts.timeout || 300 }),
+  })).json();
+}
+export async function stopCapture(rule) {
+  return (await api('/api/capture/stop', { method: 'POST', body: JSON.stringify({ rule }) })).json();
+}
+export async function fetchCapturePackets(rule, offset = 0, limit = 100) {
+  return (await api(`/api/capture/packets?rule=${encodeURIComponent(rule)}&offset=${offset}&limit=${limit}`)).json();
+}
+export async function fetchCaptureSessions() {
+  return (await api('/api/capture/sessions')).json();
+}
+
+// WebSocket for live capture
+export function connectCaptureWs(onPacket, onClose) {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(`${proto}//${location.host}/api/capture/ws`);
+  ws.onmessage = (e) => { try { onPacket(JSON.parse(e.data)); } catch {} };
+  ws.onclose = () => onClose?.();
+  ws.onerror = () => onClose?.();
+  return ws;
+}
+
+// Pipeline simulation
+export async function simulatePipeline(pipeline, payload) {
+  return (await api('/api/pipelines/simulate', {
+    method: 'POST',
+    body: JSON.stringify({ pipeline, payload }),
+  })).json();
+}

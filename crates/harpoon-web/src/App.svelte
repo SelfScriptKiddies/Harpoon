@@ -7,8 +7,13 @@
   import Rules from './pages/Rules.svelte';
   import RuleEditor from './pages/RuleEditor.svelte';
   import PipelineEditor from './pages/PipelineEditor.svelte';
+  import LiveTraffic from './pages/LiveTraffic.svelte';
   import Sessions from './pages/Sessions.svelte';
+  import TLS from './pages/TLS.svelte';
+  import Exporters from './pages/Exporters.svelte';
   import Events from './pages/Events.svelte';
+  import Logs from './pages/Logs.svelte';
+  import Nftables from './pages/Nftables.svelte';
   import Config from './pages/Config.svelte';
   import System from './pages/System.svelte';
 
@@ -97,10 +102,20 @@
         <PipelineEditor preset={editingPipeline}
                         onSave={() => { navigate('rules'); refreshAll(); }}
                         onCancel={() => navigate('rules')} />
+      {:else if currentPage === 'traffic'}
+        <LiveTraffic {data} />
       {:else if currentPage === 'sessions'}
         <Sessions {data} />
+      {:else if currentPage === 'tls'}
+        <TLS {data} />
+      {:else if currentPage === 'exporters'}
+        <Exporters {data} />
       {:else if currentPage === 'events'}
         <Events {data} />
+      {:else if currentPage === 'logs'}
+        <Logs {data} />
+      {:else if currentPage === 'nftables'}
+        <Nftables {data} onRefresh={refreshAll} />
       {:else if currentPage === 'config'}
         <Config {data} onRefresh={refreshAll} />
       {:else if currentPage === 'system'}

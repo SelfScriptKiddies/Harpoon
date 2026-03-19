@@ -53,6 +53,7 @@ pub async fn run_web_server(
         .route("/api/pipelines/update", post(api_pipeline_update))
         .route("/api/pipelines/delete", post(api_pipeline_delete))
         .route("/api/pipelines/validate", post(api_pipeline_validate))
+        .route("/api/pipelines/simulate", post(api_pipeline_simulate))
         .route("/api/events", get(api_events))
         .route("/api/config/toml", get(api_config_toml))
         .route("/api/nft/status", get(api_nft_status))
@@ -559,6 +560,63 @@ async fn api_pipeline_validate(
             "valid": false, "errors": [format!("{e}")],
         }))),
     }
+}
+
+#[derive(serde::Deserialize)]
+struct SimulateReq {
+    pipeline: crate::config::schema::AppPipeline,
+    payload: String,
+    #[serde(default = "default_direction")]
+    direction: String,
+}
+fn default_direction() -> String { "c2s".into() }
+
+async fn api_pipeline_simulate(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+    Json(req): Json<SimulateReq>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_auth!(state, headers);
+
+    let core_pipeline = match crate::convert::convert_pipeline_public(req.pipeline) {
+        Ok(p) => p,
+        Err(e) => return Ok(Json(serde_json::json!({"error": format!("{e}")}))),
+    };
+
+    let payload_bytes = if req.payload.starts_with("0x") {
+        // hex input
+        hex_decode_bytes(&req.payload[2..]).unwrap_or_default()
+    } else {
+        req.payload.into_bytes()
+    };
+
+    let direction = match req.direction.as_str() {
+        "s2c" => harpoon_core::types::filter::Direction::ServerToClient,
+        _ => harpoon_core::types::filter::Direction::ClientToServer,
+    };
+
+    let result = harpoon_core::pipeline::simulate::simulate(&core_pipeline, &payload_bytes, direction);
+
+    let steps: Vec<serde_json::Value> = result.steps.iter().map(|s| {
+        serde_json::json!({
+            "node_id": s.node_id,
+            "node_kind": s.node_kind,
+            "node_label": s.node_label,
+            "action": s.action,
+            "detail": s.detail,
+        })
+    }).collect();
+
+    Ok(Json(serde_json::json!({
+        "steps": steps,
+        "final_action": result.final_action,
+    })))
+}
+
+fn hex_decode_bytes(s: &str) -> Option<Vec<u8>> {
+    let s = s.replace(' ', "");
+    if s.len() % 2 != 0 { return None; }
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i+2], 16).ok()).collect()
 }
 
 /// Generic config modifier: mutate AppConfig → validate → save → apply.
