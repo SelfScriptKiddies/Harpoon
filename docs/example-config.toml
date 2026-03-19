@@ -1,0 +1,34 @@
+[global]
+buffer_size = 8192
+udp_max_datagram = 65507
+shutdown_timeout_secs = 5
+
+[[rules]]
+name = "web-proxy"
+protocol = "tcp"
+listen = "0.0.0.0:8080"
+target = "10.0.0.1:80"
+
+[[rules.filters]]
+kind = "substr"
+pattern = "blocked-keyword"
+direction = "c2s"
+action = "drop"
+
+[[rules]]
+name = "dns-relay"
+protocol = "udp"
+listen = "0.0.0.0:5353"
+target = "10.0.0.5:53"
+idle_timeout_secs = 30
+
+[[rules]]
+name = "tcp-with-duplicate"
+protocol = "tcp"
+listen = "0.0.0.0:9090"
+target = "10.0.0.2:9090"
+duplicate = "10.0.0.3:9090"
+
+[rules.exporter]
+kind = "tcp"
+addr = "127.0.0.1:4000"

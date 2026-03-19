@@ -1,0 +1,17 @@
+[package]
+name = "harpoon-core"
+version = "0.1.0"
+edition = "2021"
+description = "Traffic processing engine for Harpoon proxy"
+
+[features]
+default = []
+regex-filter = ["regex"]
+
+[dependencies]
+tokio = { version = "1", features = ["net", "io-util", "rt", "sync", "time", "macros"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+thiserror = "2"
+tracing = "0.1"
+bytes = "1"
+regex = { version = "1", optional = true }

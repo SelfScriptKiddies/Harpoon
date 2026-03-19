@@ -1,0 +1,23 @@
+[package]
+name = "harpoon-app"
+version = "0.1.0"
+edition = "2021"
+description = "Harpoon MITM/traffic-analysis proxy binary"
+
+[[bin]]
+name = "harpoon"
+path = "src/main.rs"
+
+[features]
+default = []
+regex-filter = ["harpoon-core/regex-filter"]
+
+[dependencies]
+harpoon-core = { path = "../harpoon-core" }
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
