@@ -13,6 +13,28 @@ pub struct GlobalConfig {
     pub buffer_size: Option<usize>,
     pub udp_max_datagram: Option<usize>,
     pub shutdown_timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub nft: NftConfig,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct NftConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub tproxy_mark: Option<u32>,
+    #[serde(default)]
+    pub rules: Vec<NftRuleConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct NftRuleConfig {
+    pub protocol: String,
+    pub match_dport: u16,
+    pub match_dst: Option<String>,
+    pub action: String,
+    pub to_port: Option<u16>,
+    pub to_addr: Option<String>,
+    pub comment: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

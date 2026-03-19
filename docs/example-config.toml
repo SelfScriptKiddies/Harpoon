@@ -32,3 +32,30 @@ duplicate = "10.0.0.3:9090"
 [rules.exporter]
 kind = "tcp"
 addr = "127.0.0.1:4000"
+
+# --- nftables integration (optional, requires root + nft) ---
+# [global.nft]
+# enabled = true
+# tproxy_mark = 1  # fwmark for TPROXY routing
+#
+# [[global.nft.rules]]
+# protocol = "tcp"
+# match_dport = 80
+# action = "redirect"
+# to_port = 8080
+# comment = "redirect HTTP to proxy"
+#
+# [[global.nft.rules]]
+# protocol = "udp"
+# match_dport = 53
+# match_dst = "10.0.0.1"
+# action = "dnat"
+# to_addr = "10.0.0.5:5353"
+# comment = "dnat DNS"
+#
+# [[global.nft.rules]]
+# protocol = "tcp"
+# match_dport = 443
+# action = "tproxy"
+# to_port = 8443
+# comment = "transparent HTTPS intercept"

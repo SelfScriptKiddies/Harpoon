@@ -9,9 +9,11 @@ use tokio_util::sync::CancellationToken;
 use harpoon_core::types::endpoint::Protocol;
 
 use crate::config::load::load_config;
+use crate::config::schema::AppConfig;
 use crate::control::proto::RuleInfo;
 use crate::control::server::{run_control_server, ControlState};
 use crate::convert::convert;
+use crate::nft;
 
 use super::state;
 
@@ -39,8 +41,11 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
 async fn run_engine_loop(config_path: PathBuf, socket_path: &std::path::Path) -> Result<()> {
     let app_config = load_config(&config_path)
         .with_context(|| format!("loading config from {}", config_path.display()))?;
-    let core_config = convert(app_config).context("converting config")?;
 
+    // Apply nftables rules if configured
+    let (nft_active, tproxy_mark) = apply_nft_config(&app_config)?;
+
+    let core_config = convert(app_config).context("converting config")?;
     let rules_info = build_rules_info(&core_config);
 
     tracing::info!(rules = core_config.rules.len(), "starting harpoon engine");
@@ -112,6 +117,15 @@ async fn run_engine_loop(config_path: PathBuf, socket_path: &std::path::Path) ->
     cancel.cancel();
     let _ = ctrl_handle.await;
 
+    // Clean up nftables rules
+    if nft_active {
+        tracing::info!("cleaning up nftables rules");
+        let _ = nft::apply::cleanup_table();
+        if let Some(mark) = tproxy_mark {
+            let _ = nft::apply::cleanup_tproxy_routing(mark);
+        }
+    }
+
     tracing::info!("harpoon stopped");
     Ok(())
 }
@@ -167,6 +181,82 @@ fn build_rules_info(config: &harpoon_core::CoreConfig) -> Vec<RuleInfo> {
             has_exporter: r.exporter.is_some(),
         })
         .collect()
+}
+
+fn apply_nft_config(app_config: &AppConfig) -> Result<(bool, Option<u32>)> {
+    let nft_cfg = &app_config.global.nft;
+    if !nft_cfg.enabled {
+        return Ok((false, None));
+    }
+
+    if !nft::apply::check_nft_available() {
+        anyhow::bail!("nftables enabled in config but 'nft' command not found");
+    }
+
+    if nft_cfg.rules.is_empty() {
+        tracing::debug!("nft enabled but no rules configured");
+        return Ok((false, None));
+    }
+
+    let mut nft_rules = Vec::new();
+    let mut has_tproxy = false;
+
+    for r in &nft_cfg.rules {
+        let protocol = match r.protocol.to_lowercase().as_str() {
+            "tcp" => nft::render::NftProtocol::Tcp,
+            "udp" => nft::render::NftProtocol::Udp,
+            other => anyhow::bail!("unknown nft rule protocol: {other}"),
+        };
+
+        let match_dst = r
+            .match_dst
+            .as_ref()
+            .map(|s| s.parse())
+            .transpose()
+            .context("invalid match_dst address")?;
+
+        let action = match r.action.to_lowercase().as_str() {
+            "redirect" => {
+                let port = r.to_port.context("redirect action requires to_port")?;
+                nft::render::NftAction::Redirect { to_port: port }
+            }
+            "dnat" => {
+                let addr_str = r.to_addr.as_ref().context("dnat action requires to_addr")?;
+                let addr = addr_str.parse().context("invalid dnat to_addr")?;
+                nft::render::NftAction::Dnat { to_addr: addr }
+            }
+            "tproxy" => {
+                let port = r.to_port.context("tproxy action requires to_port")?;
+                let mark = nft_cfg.tproxy_mark.unwrap_or(0x1);
+                has_tproxy = true;
+                nft::render::NftAction::Tproxy { to_port: port, mark }
+            }
+            other => anyhow::bail!("unknown nft action: {other}"),
+        };
+
+        nft_rules.push(nft::render::NftRule {
+            protocol,
+            match_dport: r.match_dport,
+            match_dst: match_dst,
+            action,
+            comment: r.comment.clone(),
+        });
+    }
+
+    let tproxy_mark = if has_tproxy {
+        let mark = nft_cfg.tproxy_mark.unwrap_or(0x1);
+        let ruleset = nft::render::render_tproxy_install(&nft_rules, mark);
+        nft::apply::apply_with_rollback(&ruleset)?;
+        nft::apply::setup_tproxy_routing(mark)?;
+        Some(mark)
+    } else {
+        let ruleset = nft::render::render_install(&nft_rules);
+        nft::apply::apply_with_rollback(&ruleset)?;
+        None
+    };
+
+    tracing::info!(rules = nft_rules.len(), "nftables rules applied");
+    Ok((true, tproxy_mark))
 }
 
 fn daemonize(pid_file: &std::path::Path) -> Result<()> {

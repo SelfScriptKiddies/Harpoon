@@ -3,6 +3,7 @@ mod config;
 mod control;
 mod convert;
 mod daemon;
+mod nft;
 mod run;
 
 use clap::Parser;
