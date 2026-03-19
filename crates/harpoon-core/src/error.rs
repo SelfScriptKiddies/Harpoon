@@ -35,6 +35,12 @@ pub enum HarpoonError {
     #[error("transparent socket error: {0}")]
     TransparentSocket(String),
 
+    #[error("pipeline validation error in '{pipeline}': {detail}")]
+    PipelineValidation { pipeline: String, detail: String },
+
+    #[error("pipeline compile error in '{pipeline}': {detail}")]
+    PipelineCompile { pipeline: String, detail: String },
+
     #[error("engine shutdown")]
     Shutdown,
 }
