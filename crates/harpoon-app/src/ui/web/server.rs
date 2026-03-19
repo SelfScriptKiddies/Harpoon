@@ -1,11 +1,12 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use axum::extract::State;
-use axum::http::{header, HeaderMap, StatusCode};
-use axum::response::{Html, Json};
+use axum::extract::{Path as AxumPath, State};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use include_dir::{include_dir, Dir};
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
@@ -13,7 +14,7 @@ use tower_http::cors::CorsLayer;
 use crate::control::proto::{EventInfo, RuleInfo, RuleStatsInfo, StatusInfo};
 use crate::control::server::ControlState;
 
-const INDEX_HTML: &str = include_str!("assets/index.html");
+static STATIC_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/src/ui/web/static");
 
 pub struct WebState {
     pub control: Arc<RwLock<ControlState>>,
@@ -36,7 +37,7 @@ pub async fn run_web_server(
     let app = Router::new()
         // Public
         .route("/api/auth/login", post(api_login))
-        // Protected
+        // Protected API
         .route("/api/status", get(api_status))
         .route("/api/stats", get(api_stats))
         .route("/api/rules", get(api_rules))
@@ -45,9 +46,16 @@ pub async fn run_web_server(
         .route("/api/rules/update", post(api_rule_update))
         .route("/api/rules/delete", post(api_rule_delete))
         .route("/api/events", get(api_events))
+        .route("/api/config/toml", get(api_config_toml))
+        .route("/api/nft/status", get(api_nft_status))
+        .route("/api/nft/preview", get(api_nft_preview))
+        .route("/api/nft/apply", post(api_nft_apply))
+        .route("/api/nft/rollback", post(api_nft_rollback))
         .route("/api/reload", post(api_reload))
         .route("/api/stop", post(api_stop))
+        // Static files
         .route("/", get(index_page))
+        .route("/{*path}", get(static_file))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -62,6 +70,43 @@ pub async fn run_web_server(
 
     Ok(())
 }
+
+// --- Static file serving ---
+
+async fn index_page() -> impl IntoResponse {
+    serve_static("index.html")
+}
+
+async fn static_file(AxumPath(path): AxumPath<String>) -> impl IntoResponse {
+    serve_static(&path)
+}
+
+fn serve_static(path: &str) -> Response {
+    match STATIC_DIR.get_file(path) {
+        Some(file) => {
+            let mime = match path.rsplit('.').next() {
+                Some("html") => "text/html; charset=utf-8",
+                Some("css") => "text/css; charset=utf-8",
+                Some("js") => "application/javascript; charset=utf-8",
+                Some("json") => "application/json",
+                Some("svg") => "image/svg+xml",
+                Some("png") => "image/png",
+                _ => "application/octet-stream",
+            };
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, HeaderValue::from_static(mime))
+                .body(axum::body::Body::from(file.contents().to_vec()))
+                .unwrap()
+        }
+        None => Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(axum::body::Body::from("Not found"))
+            .unwrap(),
+    }
+}
+
+// --- Auth ---
 
 fn check_auth(headers: &HeaderMap, tokens: &HashSet<String>) -> bool {
     headers
@@ -114,16 +159,17 @@ macro_rules! require_auth {
     }};
 }
 
+// --- Data API ---
+
 async fn api_status(
     State(state): State<Arc<WebState>>,
     headers: HeaderMap,
 ) -> Result<Json<StatusInfo>, StatusCode> {
     require_auth!(state, headers);
     let s = state.control.read().await;
-    let uptime = s.start_time.elapsed().as_secs();
     Ok(Json(StatusInfo {
         running: s.engine_handle.is_some(),
-        uptime_secs: uptime,
+        uptime_secs: s.start_time.elapsed().as_secs(),
         rules_count: s.rules_info.len(),
         config_path: s.config_path.display().to_string(),
     }))
@@ -136,14 +182,9 @@ async fn api_stats(
     require_auth!(state, headers);
     let s = state.control.read().await;
     match &s.engine_handle {
-        Some(handle) => {
-            let stats: Vec<RuleStatsInfo> = handle
-                .stats_snapshot()
-                .into_iter()
-                .map(RuleStatsInfo::from)
-                .collect();
-            Ok(Json(stats))
-        }
+        Some(handle) => Ok(Json(
+            handle.stats_snapshot().into_iter().map(RuleStatsInfo::from).collect(),
+        )),
         None => Ok(Json(vec![])),
     }
 }
@@ -176,10 +217,122 @@ async fn api_events(
     require_auth!(state, headers);
     let s = state.control.read().await;
     let events = s.recent_events.lock().await;
-    let n = 200.min(events.len());
-    let tail = events[events.len() - n..].to_vec();
-    Ok(Json(tail))
+    let n = 500.min(events.len());
+    Ok(Json(events[events.len() - n..].to_vec()))
 }
+
+async fn api_config_toml(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_auth!(state, headers);
+    let s = state.control.read().await;
+    match &s.app_config {
+        Some(cfg) => {
+            let toml_str = toml::to_string_pretty(cfg).unwrap_or_else(|e| format!("# Error: {e}"));
+            Ok(Json(serde_json::json!({ "toml": toml_str })))
+        }
+        None => Ok(Json(serde_json::json!({ "toml": "# No config loaded" }))),
+    }
+}
+
+// --- nftables API ---
+
+async fn api_nft_status(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_auth!(state, headers);
+    let available = crate::nft::apply::check_nft_available();
+    Ok(Json(serde_json::json!({ "available": available })))
+}
+
+async fn api_nft_preview(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_auth!(state, headers);
+    let s = state.control.read().await;
+    match &s.app_config {
+        Some(cfg) if cfg.global.nft.enabled => {
+            let nft_rules = build_nft_rules(&cfg.global.nft);
+            let has_tproxy = nft_rules.iter().any(|r| matches!(r.action, crate::nft::render::NftAction::Tproxy { .. }));
+            let ruleset = if has_tproxy {
+                let mark = cfg.global.nft.tproxy_mark.unwrap_or(0x1);
+                crate::nft::render::render_tproxy_install(&nft_rules, mark)
+            } else {
+                crate::nft::render::render_install(&nft_rules)
+            };
+            Ok(Json(serde_json::json!({ "ruleset": ruleset })))
+        }
+        _ => Ok(Json(serde_json::json!({ "ruleset": "# nft not enabled in config" }))),
+    }
+}
+
+async fn api_nft_apply(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_auth!(state, headers);
+    let s = state.control.read().await;
+    match &s.app_config {
+        Some(cfg) if cfg.global.nft.enabled => {
+            let nft_rules = build_nft_rules(&cfg.global.nft);
+            let ruleset = crate::nft::render::render_install(&nft_rules);
+            match crate::nft::apply::apply_with_rollback(&ruleset) {
+                Ok(_) => Ok(Json(serde_json::json!({ "ok": true }))),
+                Err(e) => Ok(Json(serde_json::json!({ "ok": false, "error": e.to_string() }))),
+            }
+        }
+        _ => Ok(Json(serde_json::json!({ "ok": false, "error": "nft not enabled" }))),
+    }
+}
+
+async fn api_nft_rollback(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_auth!(state, headers);
+    match crate::nft::apply::cleanup_table() {
+        Ok(_) => Ok(Json(serde_json::json!({ "ok": true }))),
+        Err(e) => Ok(Json(serde_json::json!({ "ok": false, "error": e.to_string() }))),
+    }
+}
+
+fn build_nft_rules(nft_cfg: &crate::config::schema::NftConfig) -> Vec<crate::nft::render::NftRule> {
+    nft_cfg
+        .rules
+        .iter()
+        .filter_map(|r| {
+            let protocol = match r.protocol.to_lowercase().as_str() {
+                "tcp" => crate::nft::render::NftProtocol::Tcp,
+                "udp" => crate::nft::render::NftProtocol::Udp,
+                _ => return None,
+            };
+            let match_dst = r.match_dst.as_ref().and_then(|s| s.parse().ok());
+            let action = match r.action.to_lowercase().as_str() {
+                "redirect" => crate::nft::render::NftAction::Redirect { to_port: r.to_port? },
+                "dnat" => crate::nft::render::NftAction::Dnat {
+                    to_addr: r.to_addr.as_ref()?.parse().ok()?,
+                },
+                "tproxy" => crate::nft::render::NftAction::Tproxy {
+                    to_port: r.to_port?,
+                    mark: nft_cfg.tproxy_mark.unwrap_or(0x1),
+                },
+                _ => return None,
+            };
+            Some(crate::nft::render::NftRule {
+                protocol,
+                match_dport: r.match_dport,
+                match_dst,
+                action,
+                comment: r.comment.clone(),
+            })
+        })
+        .collect()
+}
+
+// --- Actions ---
 
 async fn api_reload(
     State(state): State<Arc<WebState>>,
@@ -203,6 +356,8 @@ async fn api_stop(
     s.cancel.cancel();
     Ok(Json(serde_json::json!({"ok": true})))
 }
+
+// --- Rule CRUD ---
 
 async fn api_rule_create(
     State(state): State<Arc<WebState>>,
@@ -265,7 +420,6 @@ async fn api_rule_delete(
     .await
 }
 
-/// Modify rules in the AppConfig, save to disk, and reload the engine.
 async fn modify_rules<F>(
     state: &Arc<WebState>,
     f: F,
@@ -283,32 +437,19 @@ where
         return Ok(Json(serde_json::json!({"ok": false, "error": msg})));
     }
 
-    // Validate by attempting conversion
     if let Err(e) = crate::convert::convert(app_config.clone()) {
-        return Ok(Json(
-            serde_json::json!({"ok": false, "error": format!("validation: {e}")}),
-        ));
+        return Ok(Json(serde_json::json!({"ok": false, "error": format!("validation: {e}")})));
     }
 
-    // Save to disk
     if let Err(e) = crate::config::load::save_config(&config_path, &app_config) {
-        return Ok(Json(
-            serde_json::json!({"ok": false, "error": format!("save: {e}")}),
-        ));
+        return Ok(Json(serde_json::json!({"ok": false, "error": format!("save: {e}")})));
     }
 
-    // Apply: stop old engine, start new
     if let Err(e) =
         crate::daemon::run::apply_app_config(&state.control, app_config, &config_path).await
     {
-        return Ok(Json(
-            serde_json::json!({"ok": false, "error": format!("apply: {e}")}),
-        ));
+        return Ok(Json(serde_json::json!({"ok": false, "error": format!("apply: {e}")})));
     }
 
     Ok(Json(serde_json::json!({"ok": true})))
-}
-
-async fn index_page() -> Html<&'static str> {
-    Html(INDEX_HTML)
 }

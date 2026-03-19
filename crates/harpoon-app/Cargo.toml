@@ -13,7 +13,7 @@ default = []
 regex-filter = ["harpoon-core/regex-filter"]
 tls = ["harpoon-core/tls"]
 transparent-udp = ["harpoon-core/transparent-udp"]
-web = ["axum", "tower-http"]
+web = ["axum", "tower-http", "include_dir"]
 
 [dependencies]
 harpoon-core = { path = "../harpoon-core" }
@@ -29,3 +29,4 @@ anyhow = "1"
 libc = "0.2"
 axum = { version = "0.8", optional = true }
 tower-http = { version = "0.6", features = ["cors"], optional = true }
+include_dir = { version = "0.7", optional = true }
