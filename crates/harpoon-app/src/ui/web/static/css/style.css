@@ -151,6 +151,13 @@ a:hover { color: var(--accent-strong); }
   border-color: var(--accent);
 }
 
+.login-error {
+  color: var(--status-error);
+  font-size: 12px;
+  margin-bottom: 8px;
+  min-height: 16px;
+}
+
 .login-box .btn {
   width: 100%;
   margin-top: 4px;
@@ -661,7 +668,7 @@ tr:hover td {
   position: fixed;
   inset: 0;
   background: rgba(0, 0, 0, 0.6);
-  display: flex;
+  display: none;
   align-items: center;
   justify-content: center;
   z-index: 5000;

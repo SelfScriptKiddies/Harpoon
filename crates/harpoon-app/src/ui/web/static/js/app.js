@@ -142,12 +142,12 @@ const App = {
     const dot   = document.getElementById('status-dot');
     const label = document.getElementById('status-label');
 
-    if (App.data.status) {
+    if (App.data.status && App.data.status.running) {
       dot.className   = 'status-dot ok';
       label.textContent = 'Running';
     } else {
       dot.className   = 'status-dot err';
-      label.textContent = 'Unreachable';
+      label.textContent = App.data.status ? 'Stopped' : 'Unreachable';
     }
 
     const rulesCount = document.getElementById('chip-rules');
@@ -160,8 +160,8 @@ const App = {
     let totalTcp = 0;
     let totalUdp = 0;
     for (const s of App.data.stats) {
-      totalTcp += s.tcp_connections || 0;
-      totalUdp += s.udp_sessions   || 0;
+      totalTcp += s.active_tcp_connections || 0;
+      totalUdp += s.active_udp_sessions   || 0;
     }
     if (tcpCount) tcpCount.textContent = totalTcp;
     if (udpCount) udpCount.textContent = totalUdp;
