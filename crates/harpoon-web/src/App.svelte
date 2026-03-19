@@ -5,6 +5,7 @@
   import Login from './pages/Login.svelte';
   import Overview from './pages/Overview.svelte';
   import Rules from './pages/Rules.svelte';
+  import RuleEditor from './pages/RuleEditor.svelte';
   import PipelineEditor from './pages/PipelineEditor.svelte';
   import Sessions from './pages/Sessions.svelte';
   import Events from './pages/Events.svelte';
@@ -14,7 +15,8 @@
   let authenticated = $state(false);
   let currentPage = $state('overview');
   let data = $state({ status: null, stats: [], rules: [], rulesFull: [], events: [] });
-  let editingPipeline = $state(null);
+  let editingRule = $state(null);       // for Simple mode (AppRule object or null)
+  let editingPipeline = $state(null);   // for Pipeline mode (preset or null)
 
   async function checkAuth() {
     if (!getToken()) return;
@@ -45,13 +47,28 @@
   }
 
   function navigate(page) {
+    editingRule = null;
     editingPipeline = null;
     currentPage = page;
   }
 
+  // Open Simple form editor (from Rules page "Edit" button or "Create Rule")
+  function openRuleEditor(rule) {
+    editingRule = rule || null;
+    editingPipeline = null;
+    currentPage = 'rule-editor';
+  }
+
+  // Open Pipeline visual editor (from Rules page or from inside RuleEditor)
   function openPipelineEditor(preset) {
     editingPipeline = preset || null;
+    editingRule = null;
     currentPage = 'pipeline-editor';
+  }
+
+  // Create new — defaults to Simple mode
+  function createNew() {
+    openRuleEditor(null);
   }
 
   checkAuth();
@@ -63,14 +80,23 @@
 {:else}
   <div class="app-layout">
     <Sidebar {currentPage} onNavigate={navigate} />
-    <Topbar {data} onRefresh={refreshAll} onLogout={handleLogout} onCreatePipeline={() => openPipelineEditor(null)} />
+    <Topbar {data} onRefresh={refreshAll} onLogout={handleLogout} onCreatePipeline={createNew} />
     <main class="main-content">
       {#if currentPage === 'overview'}
-        <Overview {data} onNavigate={navigate} onCreatePipeline={openPipelineEditor} />
+        <Overview {data} onNavigate={navigate} onCreatePipeline={createNew} />
       {:else if currentPage === 'rules'}
-        <Rules {data} onRefresh={refreshAll} onEditPipeline={openPipelineEditor} />
+        <Rules {data} onRefresh={refreshAll}
+               onEditPipeline={openPipelineEditor}
+               onEditRule={openRuleEditor}
+               onCreateRule={createNew} />
+      {:else if currentPage === 'rule-editor'}
+        <RuleEditor rule={editingRule}
+                    onSave={() => { navigate('rules'); refreshAll(); }}
+                    onCancel={() => navigate('rules')} />
       {:else if currentPage === 'pipeline-editor'}
-        <PipelineEditor preset={editingPipeline} onSave={() => { navigate('rules'); refreshAll(); }} onCancel={() => navigate('rules')} />
+        <PipelineEditor preset={editingPipeline}
+                        onSave={() => { navigate('rules'); refreshAll(); }}
+                        onCancel={() => navigate('rules')} />
       {:else if currentPage === 'sessions'}
         <Sessions {data} />
       {:else if currentPage === 'events'}

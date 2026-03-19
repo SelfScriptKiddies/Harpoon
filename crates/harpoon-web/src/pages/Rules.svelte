@@ -1,7 +1,7 @@
 <script>
   import { deleteRule } from '../lib/api.js';
 
-  let { data, onRefresh, onEditPipeline } = $props();
+  let { data, onRefresh, onEditPipeline, onEditRule, onCreateRule } = $props();
 
   function fmtBytes(n) { if(!n) return '0 B'; if(n<1024) return n+' B'; if(n<1048576) return (n/1024).toFixed(1)+' KB'; if(n<1073741824) return (n/1048576).toFixed(1)+' MB'; return (n/1073741824).toFixed(2)+' GB'; }
   function fmtUptime(s) { if(!s) return '\u2014'; if(s<60) return s+'s'; if(s<3600) return Math.floor(s/60)+'m '+(s%60)+'s'; return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'; }
@@ -75,6 +75,8 @@
   <div class="page-header">
     <h1 class="page-title">Rules</h1>
     <span class="page-count mono">{rules.length} configured</span>
+    <div style="flex:1;"></div>
+    <button class="btn btn-accent" onclick={() => onCreateRule?.()}>+ Create Rule</button>
   </div>
 
   <div class="rules-layout">
@@ -110,9 +112,10 @@
                     <td class="mono">{rule.target}</td>
                     <td>{rule.filters_count ?? 0}</td>
                     <td class="actions-cell" onclick={(e) => e.stopPropagation()}>
-                      <button class="btn btn-sm" onclick={() => handleEdit(rulesFull.find(r => r.name === rule.name) ?? rule)}>Edit</button>
+                      <button class="btn btn-sm" onclick={() => onEditRule?.(rulesFull.find(r => r.name === rule.name) ?? rule)}>Edit</button>
+                      <button class="btn btn-sm" onclick={() => handleEdit(rulesFull.find(r => r.name === rule.name) ?? rule)}>Pipeline</button>
                       <button class="btn btn-sm btn-danger" onclick={() => handleDelete(rule.name)} disabled={deleting === rule.name}>
-                        {deleting === rule.name ? '...' : 'Delete'}
+                        {deleting === rule.name ? '...' : 'Del'}
                       </button>
                     </td>
                   </tr>
