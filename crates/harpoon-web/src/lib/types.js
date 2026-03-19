@@ -177,3 +177,75 @@ export const PRESETS = [
     edges: [{ from: 1, to: 2 }],
   },
 ];
+
+/** Presets for Simple mode — map directly to form fields */
+export const SIMPLE_PRESETS = [
+  {
+    id: 'tcp_redirect',
+    name: 'TCP Redirect',
+    icon: '→',
+    description: 'Forward TCP traffic to another host/port',
+    rule: { protocol: 'tcp', listen: '0.0.0.0:8080', target: '' },
+  },
+  {
+    id: 'udp_relay',
+    name: 'UDP Relay',
+    icon: '⇄',
+    description: 'Relay UDP datagrams with session tracking',
+    rule: { protocol: 'udp', listen: '0.0.0.0:5353', target: '8.8.8.8:53', idle_timeout_secs: 30 },
+  },
+  {
+    id: 'tcp_tls_terminate',
+    name: 'TLS Terminate',
+    icon: '🔓',
+    description: 'Terminate TLS, forward plaintext to upstream',
+    rule: {
+      protocol: 'tcp', listen: '0.0.0.0:8443', target: '',
+      tls: { mode: 'terminate', ca_cert: '/etc/harpoon/ca.pem', ca_key: '/etc/harpoon/ca-key.pem' },
+    },
+  },
+  {
+    id: 'tcp_tls_mitm',
+    name: 'TLS MITM',
+    icon: '🔐',
+    description: 'Full MITM: terminate client TLS, re-encrypt to upstream',
+    rule: {
+      protocol: 'tcp', listen: '0.0.0.0:8443', target: '',
+      tls: { mode: 'mitm', ca_cert: '/etc/harpoon/ca.pem', ca_key: '/etc/harpoon/ca-key.pem' },
+    },
+  },
+  {
+    id: 'tcp_filter',
+    name: 'TCP with Filter',
+    icon: '⚡',
+    description: 'Forward TCP with payload filtering',
+    rule: {
+      protocol: 'tcp', listen: '0.0.0.0:8080', target: '',
+      filters: [{ kind: 'substr', pattern: '', direction: 'c2s', action: 'drop' }],
+    },
+  },
+  {
+    id: 'tcp_duplicate',
+    name: 'Duplicate Traffic',
+    icon: '⑂',
+    description: 'Forward and mirror traffic to a second endpoint',
+    rule: { protocol: 'tcp', listen: '0.0.0.0:8080', target: '', duplicate: '' },
+  },
+  {
+    id: 'tcp_export',
+    name: 'Export to Sink',
+    icon: '📤',
+    description: 'Forward traffic and export events to external analyzer',
+    rule: {
+      protocol: 'tcp', listen: '0.0.0.0:8080', target: '',
+      exporter: { kind: 'tcp', addr: '127.0.0.1:4000' },
+    },
+  },
+  {
+    id: 'blank',
+    name: 'Blank Rule',
+    icon: '○',
+    description: 'Start from scratch',
+    rule: { protocol: 'tcp', listen: '', target: '' },
+  },
+];

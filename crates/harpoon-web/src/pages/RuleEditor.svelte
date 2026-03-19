@@ -1,10 +1,11 @@
 <script>
   import { createRule, updateRule } from '../lib/api.js';
+  import { SIMPLE_PRESETS } from '../lib/types.js';
   import PipelineEditor from './PipelineEditor.svelte';
 
   let { rule = null, onSave, onCancel } = $props();
 
-  let mode = $state('simple'); // simple | pipeline | summary
+  let mode = $state(rule ? 'simple' : 'presets'); // presets | simple | pipeline | summary
   let isEditing = $derived(!!rule?.name);
   let error = $state('');
   let saving = $state(false);
@@ -44,6 +45,27 @@
     const arr = [...filters];
     [arr[i], arr[i + dir]] = [arr[i + dir], arr[i]];
     filters = arr;
+  }
+
+  function applyPreset(preset) {
+    const r = preset.rule;
+    protocol = r.protocol || 'tcp';
+    listen = r.listen || '';
+    target = r.target || '';
+    duplicate = r.duplicate || '';
+    idleTimeout = r.idle_timeout_secs || 30;
+    udpSourceMode = r.udp_source_mode || 'proxy';
+    tlsEnabled = !!r.tls;
+    tlsMode = r.tls?.mode || 'terminate';
+    tlsCaCert = r.tls?.ca_cert || '';
+    tlsCaKey = r.tls?.ca_key || '';
+    exporterEnabled = !!r.exporter;
+    exporterKind = r.exporter?.kind || 'tcp';
+    exporterPath = r.exporter?.path || '';
+    exporterAddr = r.exporter?.addr || '';
+    filters = (r.filters || []).map(f => ({ ...f }));
+    name = '';
+    mode = 'simple';
   }
 
   // Build rule payload
@@ -136,25 +158,49 @@
 </script>
 
 <div class="editor-page">
-  <!-- Mode Tabs -->
-  <div class="mode-tabs">
-    <button class="mode-tab" class:active={mode === 'simple'} onclick={() => mode = 'simple'}>Simple</button>
-    <button class="mode-tab" class:active={mode === 'pipeline'} onclick={() => mode = 'pipeline'}>Pipeline</button>
-    <button class="mode-tab" class:active={mode === 'summary'} onclick={() => mode = 'summary'}>Summary</button>
-    <div class="mode-tabs-spacer"></div>
-    {#if mode === 'simple'}
-      <button class="btn btn-accent" onclick={handleSave} disabled={saving}>
-        {saving ? 'Saving...' : isEditing ? 'Update & Apply' : 'Save & Apply'}
-      </button>
-      <button class="btn" onclick={onCancel}>Cancel</button>
+  {#if mode === 'presets'}
+    <!-- Preset Picker -->
+    <div class="presets-page">
+      <div class="presets-header">
+        <h1 class="presets-title">Create Rule</h1>
+        <p class="presets-subtitle">Choose a template to get started, or start from scratch</p>
+      </div>
+      <div class="preset-grid">
+        {#each SIMPLE_PRESETS as p}
+          <button class="preset-card" onclick={() => applyPreset(p)}>
+            <div class="preset-icon">{p.icon}</div>
+            <div class="preset-name">{p.name}</div>
+            <div class="preset-desc">{p.description}</div>
+          </button>
+        {/each}
+      </div>
+      <div style="margin-top: 16px;">
+        <button class="btn" onclick={onCancel}>Cancel</button>
+      </div>
+    </div>
+  {:else}
+    <!-- Mode Tabs -->
+    <div class="mode-tabs">
+      <button class="mode-tab" class:active={mode === 'simple'} onclick={() => mode = 'simple'}>Simple</button>
+      <button class="mode-tab" class:active={mode === 'pipeline'} onclick={() => mode = 'pipeline'}>Pipeline</button>
+      <button class="mode-tab" class:active={mode === 'summary'} onclick={() => mode = 'summary'}>Summary</button>
+      <div class="mode-tabs-spacer"></div>
+      {#if mode === 'simple'}
+        {#if !isEditing}
+          <button class="btn" onclick={() => mode = 'presets'}>← Presets</button>
+        {/if}
+        <button class="btn btn-accent" onclick={handleSave} disabled={saving}>
+          {saving ? 'Saving...' : isEditing ? 'Update & Apply' : 'Save & Apply'}
+        </button>
+        <button class="btn" onclick={onCancel}>Cancel</button>
+      {/if}
+    </div>
+
+    {#if error}
+      <div class="form-error">{error}</div>
     {/if}
-  </div>
 
-  {#if error}
-    <div class="form-error">{error}</div>
-  {/if}
-
-  {#if mode === 'simple'}
+    {#if mode === 'simple'}
     <div class="simple-layout">
       <!-- Form -->
       <div class="form-sections">
@@ -406,10 +452,27 @@
       </div>
     </div>
   {/if}
+  {/if}
 </div>
 
 <style>
   .editor-page { display: flex; flex-direction: column; gap: 0; }
+
+  .presets-page { max-width: 820px; }
+  .presets-header { margin-bottom: 24px; }
+  .presets-title { font-size: 22px; font-weight: 700; color: var(--text); margin-bottom: 4px; }
+  .presets-subtitle { font-size: 13px; color: var(--text-3); }
+  .preset-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; }
+  .preset-card {
+    display: flex; flex-direction: column; align-items: flex-start; gap: 4px;
+    padding: 16px; background: var(--bg-2); border: 1px solid var(--bg-4);
+    border-radius: var(--radius); cursor: pointer; text-align: left;
+    color: var(--text); font-family: var(--font); transition: all .15s;
+  }
+  .preset-card:hover { border-color: var(--accent); background: var(--bg-3); }
+  .preset-icon { font-size: 20px; margin-bottom: 4px; }
+  .preset-name { font-size: 13px; font-weight: 600; }
+  .preset-desc { font-size: 11px; color: var(--text-3); line-height: 1.4; }
 
   .mode-tabs {
     display: flex; align-items: center; gap: 0; margin-bottom: 20px;
