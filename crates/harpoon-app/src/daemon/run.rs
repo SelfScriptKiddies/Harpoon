@@ -177,6 +177,14 @@ pub async fn apply_app_config(
     let core_config = convert(app_config).context("converting config")?;
     let new_rules_info = build_rules_info(&core_config);
 
+    // Preserve capture manager across reloads
+    let capture = {
+        let s = state.read().await;
+        s.engine_handle.as_ref()
+            .map(|h| h.capture_manager().clone())
+            .unwrap_or_else(|| harpoon_core::capture::CaptureManager::new())
+    };
+
     // Stop old engine
     {
         let mut s = state.write().await;
@@ -186,8 +194,8 @@ pub async fn apply_app_config(
         }
     }
 
-    // Start new engine
-    let new_handle = harpoon_core::run(core_config)
+    // Start new engine with preserved capture manager
+    let new_handle = harpoon_core::engine::run_with_capture(core_config, capture)
         .await
         .context("starting new engine")?;
 

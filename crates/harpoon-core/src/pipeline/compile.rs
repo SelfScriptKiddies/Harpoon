@@ -72,14 +72,14 @@ pub struct DagPlan {
     pub stages: Vec<DagStage>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DagStage {
     pub node_id: NodeId,
     pub kind: NodeKind,
     pub outputs: Vec<DagOutput>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DagOutput {
     pub target_stage_index: usize,
     pub port: Option<String>,

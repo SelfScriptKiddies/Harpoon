@@ -1,3 +1,4 @@
+pub mod dag_executor;
 pub mod executor;
 pub mod filter;
 pub mod tcp;

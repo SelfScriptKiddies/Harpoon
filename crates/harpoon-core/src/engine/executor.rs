@@ -220,33 +220,9 @@ fn spawn_dag(
     capture: Arc<CaptureManager>,
     #[cfg(feature = "tls")] ca: Option<Arc<CertAuthority>>,
 ) -> JoinHandle<Result<(), HarpoonError>> {
-    // DAG executor: for now, extract linear components and run as linear.
-    // Full DAG execution with branching is a future enhancement.
-    // Extract the first Forward node as target.
-    let forward = plan.stages.iter().find_map(|s| {
-        if let crate::types::pipeline::NodeKind::Forward(ref cfg) = s.kind {
-            Some(cfg.clone())
-        } else {
-            None
-        }
-    });
+    let proto = plan.source.endpoint.protocol;
 
-    let filters: Vec<CompiledFilter> = plan.stages.iter().filter_map(|s| {
-        if let crate::types::pipeline::NodeKind::Filter(ref cfg) = s.kind {
-            Some(cfg.filters.iter().filter_map(|f| CompiledFilter::new(f.clone()).ok()).collect::<Vec<_>>())
-        } else {
-            None
-        }
-    }).flatten().collect();
-
-    let dup_addr = plan.stages.iter().find_map(|s| {
-        if let crate::types::pipeline::NodeKind::Duplicate(ref cfg) = s.kind {
-            Some(cfg.endpoint.addr)
-        } else {
-            None
-        }
-    });
-
+    // Setup exporter if present
     let export_tx = plan.stages.iter().find_map(|s| {
         if let crate::types::pipeline::NodeKind::Export(ref cfg) = s.kind {
             let (tx, rx) = mpsc::channel(export_channel_capacity);
@@ -257,46 +233,41 @@ fn spawn_dag(
         }
     });
 
-    let proto = plan.source.endpoint.protocol;
+    match proto {
+        Protocol::Tcp => {
+            tokio::spawn(super::dag_executor::run_dag_tcp(
+                plan, stats, event_tx, export_tx, cancel,
+                buffer_size, tcp_nodelay, capture,
+            ))
+        }
+        Protocol::Udp => {
+            // UDP DAG: extract linear components (full DAG for UDP is future)
+            let forward = plan.stages.iter().find_map(|s| {
+                if let crate::types::pipeline::NodeKind::Forward(ref cfg) = s.kind { Some(cfg.clone()) } else { None }
+            });
+            let filters: Vec<CompiledFilter> = plan.stages.iter().filter_map(|s| {
+                if let crate::types::pipeline::NodeKind::Filter(ref cfg) = s.kind {
+                    Some(cfg.filters.iter().filter_map(|f| CompiledFilter::new(f.clone()).ok()).collect::<Vec<_>>())
+                } else { None }
+            }).flatten().collect();
 
-    match (proto, forward) {
-        (Protocol::Tcp, Some(fwd)) => {
-            let params = TcpParams {
-                name: plan.pipeline_name,
-                listen_addr: plan.source.endpoint.addr,
-                target_addr: fwd.endpoint.addr,
-                filters: Arc::new(filters),
-                duplicate_addr: dup_addr,
-                buffer_size,
-                tcp_nodelay,
-                capture: capture.clone(),
-                #[cfg(feature = "tls")] ca,
-                #[cfg(feature = "tls")] tls_terminate: false,
-                #[cfg(feature = "tls")] tls_initiate: false,
-            };
-            tokio::spawn(super::tcp::run_tcp_pipeline(
-                params, stats, event_tx, export_tx, cancel,
-            ))
-        }
-        (Protocol::Udp, Some(fwd)) => {
-            let params = UdpParams {
-                name: plan.pipeline_name,
-                listen_addr: plan.source.endpoint.addr,
-                target_addr: fwd.endpoint.addr,
-                filters: Arc::new(filters),
-                duplicate_addr: dup_addr,
-                capture: capture.clone(),
-                udp_source_mode: plan.source.udp_source_mode,
-                idle_timeout_secs: plan.source.idle_timeout_secs,
-                max_datagram,
-            };
-            tokio::spawn(super::udp::run_udp_pipeline(
-                params, stats, event_tx, export_tx, cancel,
-            ))
-        }
-        _ => {
-            // No forward node — pipeline drops everything
-            tokio::spawn(async { Ok(()) })
+            match forward {
+                Some(fwd) => {
+                    let params = UdpParams {
+                        name: plan.pipeline_name,
+                        listen_addr: plan.source.endpoint.addr,
+                        target_addr: fwd.endpoint.addr,
+                        filters: Arc::new(filters),
+                        duplicate_addr: None,
+                        capture,
+                        udp_source_mode: plan.source.udp_source_mode,
+                        idle_timeout_secs: plan.source.idle_timeout_secs,
+                        max_datagram,
+                    };
+                    tokio::spawn(super::udp::run_udp_pipeline(params, stats, event_tx, export_tx, cancel))
+                }
+                None => tokio::spawn(async { Ok(()) }),
+            }
         }
     }
 }
