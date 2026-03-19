@@ -13,6 +13,8 @@ pub struct DuplicateTarget {
 pub enum ExporterKind {
     Uds { path: PathBuf },
     TcpFramed { addr: SocketAddr },
+    /// Pipe to an external process stdin (for Red Eye integration)
+    Pipe { command: String, args: Vec<String> },
 }
 
 #[derive(Debug, Clone)]

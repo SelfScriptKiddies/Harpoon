@@ -21,6 +21,7 @@ pub struct WebState {
     pub password: String,
     pub tokens: Mutex<HashSet<String>>,
     pub capture: Arc<harpoon_core::capture::CaptureManager>,
+    pub metrics: Arc<harpoon_core::capture::metrics::MetricsCollector>,
 }
 
 pub async fn run_web_server(
@@ -28,6 +29,7 @@ pub async fn run_web_server(
     control: Arc<RwLock<ControlState>>,
     password: String,
     capture: Arc<harpoon_core::capture::CaptureManager>,
+    metrics: Arc<harpoon_core::capture::metrics::MetricsCollector>,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     let state = Arc::new(WebState {
@@ -35,6 +37,7 @@ pub async fn run_web_server(
         password,
         tokens: Mutex::new(HashSet::new()),
         capture,
+        metrics,
     });
 
     let app = Router::new()
@@ -60,6 +63,8 @@ pub async fn run_web_server(
         .route("/api/nft/preview", get(api_nft_preview))
         .route("/api/nft/apply", post(api_nft_apply))
         .route("/api/nft/rollback", post(api_nft_rollback))
+        .route("/api/metrics/global", get(api_metrics_global))
+        .route("/api/metrics/rule", get(api_metrics_rule))
         .route("/api/capture/start", post(api_capture_start))
         .route("/api/capture/stop", post(api_capture_stop))
         .route("/api/capture/packets", get(api_capture_packets))
@@ -650,6 +655,48 @@ where
     }
 
     Ok(Json(serde_json::json!({"ok": true})))
+}
+
+// --- Metrics API ---
+
+async fn api_metrics_global(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_auth!(state, headers);
+    let points = state.metrics.get_global_history().await;
+    let json: Vec<serde_json::Value> = points.iter().map(|p| {
+        serde_json::json!({
+            "t": p.timestamp_ms,
+            "bi": p.bytes_in_rate, "bo": p.bytes_out_rate,
+            "pi": p.packets_in_rate, "po": p.packets_out_rate,
+            "tcp": p.tcp_connections, "udp": p.udp_sessions,
+            "drops": p.drops_rate,
+        })
+    }).collect();
+    Ok(Json(serde_json::json!({ "points": json })))
+}
+
+#[derive(serde::Deserialize)]
+struct MetricsRuleQuery { rule: String }
+
+async fn api_metrics_rule(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<MetricsRuleQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_auth!(state, headers);
+    let points = state.metrics.get_rule_history(&q.rule).await;
+    let json: Vec<serde_json::Value> = points.iter().map(|p| {
+        serde_json::json!({
+            "t": p.timestamp_ms,
+            "bi": p.bytes_in_rate, "bo": p.bytes_out_rate,
+            "pi": p.packets_in_rate, "po": p.packets_out_rate,
+            "tcp": p.tcp_connections, "udp": p.udp_sessions,
+            "drops": p.drops_rate,
+        })
+    }).collect();
+    Ok(Json(serde_json::json!({ "points": json })))
 }
 
 // --- Capture API ---

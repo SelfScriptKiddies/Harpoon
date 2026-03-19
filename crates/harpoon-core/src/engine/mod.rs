@@ -29,6 +29,7 @@ pub struct EngineHandle {
     stats: Vec<(String, Arc<RuleStats>)>,
     join_handles: Vec<JoinHandle<Result<(), HarpoonError>>>,
     capture: Arc<crate::capture::CaptureManager>,
+    metrics: Arc<crate::capture::metrics::MetricsCollector>,
 }
 
 impl EngineHandle {
@@ -66,6 +67,10 @@ impl EngineHandle {
 
     pub fn capture_manager(&self) -> &Arc<crate::capture::CaptureManager> {
         &self.capture
+    }
+
+    pub fn metrics_collector(&self) -> &Arc<crate::capture::metrics::MetricsCollector> {
+        &self.metrics
     }
 }
 
@@ -126,12 +131,21 @@ pub async fn run_with_capture(
         handles.push(h);
     }
 
+    // Spawn metrics collector
+    let metrics = crate::capture::metrics::MetricsCollector::new();
+    crate::capture::metrics::spawn_metrics_collector(
+        metrics.clone(),
+        stats_vec.clone(),
+        cancel.child_token(),
+    );
+
     Ok(EngineHandle {
         cancel,
         event_tx,
         stats: stats_vec,
         join_handles: handles,
         capture,
+        metrics,
     })
 }
 

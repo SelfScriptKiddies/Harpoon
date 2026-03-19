@@ -96,6 +96,10 @@ export function connectCaptureWs(onPacket, onClose) {
   return ws;
 }
 
+// Metrics
+export async function fetchMetricsGlobal() { return (await api('/api/metrics/global')).json(); }
+export async function fetchMetricsRule(rule) { return (await api(`/api/metrics/rule?rule=${encodeURIComponent(rule)}`)).json(); }
+
 // Pipeline simulation
 export async function simulatePipeline(pipeline, payload) {
   return (await api('/api/pipelines/simulate', {

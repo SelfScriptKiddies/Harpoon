@@ -11,7 +11,7 @@ tls = ["tokio-rustls", "rustls", "rustls-pemfile", "rcgen", "rustls-pki-types", 
 transparent-udp = ["socket2", "libc"]
 
 [dependencies]
-tokio = { version = "1", features = ["net", "io-util", "rt", "sync", "time", "macros"] }
+tokio = { version = "1", features = ["net", "io-util", "rt", "sync", "time", "macros", "process"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 thiserror = "2"
 tracing = "0.1"

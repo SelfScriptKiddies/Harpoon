@@ -98,9 +98,14 @@ async fn run_engine_loop(config_path: PathBuf, socket_path: &std::path::Path) ->
         });
         let web_state = control_state.clone();
         let web_capture = capture.clone();
+        let web_metrics = {
+            let s = control_state.read().await;
+            s.engine_handle.as_ref().map(|h| h.metrics_collector().clone())
+                .unwrap_or_else(|| harpoon_core::capture::metrics::MetricsCollector::new())
+        };
         let web_cancel = cancel.child_token();
         tokio::spawn(async move {
-            if let Err(e) = crate::ui::web::server::run_web_server(web_addr, web_state, web_password, web_capture, web_cancel).await {
+            if let Err(e) = crate::ui::web::server::run_web_server(web_addr, web_state, web_password, web_capture, web_metrics, web_cancel).await {
                 tracing::error!(error = %e, "web server error");
             }
         });

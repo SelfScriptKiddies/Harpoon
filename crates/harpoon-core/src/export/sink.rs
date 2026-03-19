@@ -84,6 +84,9 @@ pub async fn run_exporter(kind: ExporterKind, mut rx: mpsc::Receiver<Event>) {
         ExporterKind::TcpFramed { addr } => {
             run_tcp_framed_exporter(addr, &mut rx).await;
         }
+        ExporterKind::Pipe { command, args } => {
+            run_pipe_exporter(&command, &args, &mut rx).await;
+        }
     }
 }
 
@@ -138,4 +141,49 @@ async fn run_tcp_framed_exporter(addr: std::net::SocketAddr, rx: &mut mpsc::Rece
             }
         }
     }
+}
+
+/// Pipe exporter: spawn external process and write framed events to its stdin.
+/// Designed for integration with Red Eye and similar analyzers.
+async fn run_pipe_exporter(command: &str, args: &[String], rx: &mut mpsc::Receiver<Event>) {
+    use tokio::process::Command;
+
+    let mut child = match Command::new(command)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(command = %command, error = %e, "pipe exporter: failed to spawn");
+            return;
+        }
+    };
+
+    tracing::info!(command = %command, "pipe exporter started");
+
+    let mut stdin = match child.stdin.take() {
+        Some(s) => s,
+        None => {
+            tracing::error!("pipe exporter: no stdin");
+            return;
+        }
+    };
+
+    while let Some(event) = rx.recv().await {
+        let payload = encode_event(&event);
+        let frame = write_length_prefixed_frame(&payload);
+
+        if let Err(e) = stdin.write_all(&frame).await {
+            tracing::warn!(error = %e, "pipe exporter write failed");
+            break;
+        }
+    }
+
+    // Clean up
+    drop(stdin);
+    let _ = child.wait().await;
+    tracing::info!(command = %command, "pipe exporter stopped");
 }
