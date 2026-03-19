@@ -10,6 +10,7 @@ pub struct RuleStats {
     pub active_udp_sessions: AtomicU64,
     pub dropped_packets: AtomicU64,
     pub filter_matches: AtomicU64,
+    pub export_drops: AtomicU64,
 }
 
 #[derive(Debug, Clone)]
@@ -23,6 +24,7 @@ pub struct RuleStatsSnapshot {
     pub active_udp_sessions: u64,
     pub dropped_packets: u64,
     pub filter_matches: u64,
+    pub export_drops: u64,
 }
 
 impl RuleStats {
@@ -37,6 +39,7 @@ impl RuleStats {
             active_udp_sessions: self.active_udp_sessions.load(Ordering::Relaxed),
             dropped_packets: self.dropped_packets.load(Ordering::Relaxed),
             filter_matches: self.filter_matches.load(Ordering::Relaxed),
+            export_drops: self.export_drops.load(Ordering::Relaxed),
         }
     }
 }

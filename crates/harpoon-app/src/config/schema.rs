@@ -50,6 +50,7 @@ pub struct AppRule {
     pub duplicate: Option<String>,
     pub exporter: Option<AppExporter>,
     pub tls: Option<AppTls>,
+    pub udp_source_mode: Option<String>,
     pub idle_timeout_secs: Option<u64>,
 }
 

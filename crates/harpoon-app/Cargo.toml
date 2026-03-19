@@ -12,6 +12,7 @@ path = "src/main.rs"
 default = []
 regex-filter = ["harpoon-core/regex-filter"]
 tls = ["harpoon-core/tls"]
+transparent-udp = ["harpoon-core/transparent-udp"]
 web = ["axum", "tower-http"]
 
 [dependencies]

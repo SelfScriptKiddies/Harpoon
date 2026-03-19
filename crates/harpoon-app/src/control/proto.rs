@@ -41,6 +41,7 @@ pub struct RuleStatsInfo {
     pub active_udp_sessions: u64,
     pub dropped_packets: u64,
     pub filter_matches: u64,
+    pub export_drops: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -73,6 +74,7 @@ impl From<harpoon_core::types::stats::RuleStatsSnapshot> for RuleStatsInfo {
             active_udp_sessions: s.active_udp_sessions,
             dropped_packets: s.dropped_packets,
             filter_matches: s.filter_matches,
+            export_drops: s.export_drops,
         }
     }
 }

@@ -8,6 +8,7 @@ description = "Traffic processing engine for Harpoon proxy"
 default = []
 regex-filter = ["regex"]
 tls = ["tokio-rustls", "rustls", "rustls-pemfile", "rcgen", "rustls-pki-types", "webpki-roots"]
+transparent-udp = ["socket2", "libc"]
 
 [dependencies]
 tokio = { version = "1", features = ["net", "io-util", "rt", "sync", "time", "macros"] }
@@ -15,6 +16,7 @@ tokio-util = { version = "0.7", features = ["codec"] }
 thiserror = "2"
 tracing = "0.1"
 bytes = "1"
+dashmap = "6"
 regex = { version = "1", optional = true }
 tokio-rustls = { version = "0.26", optional = true }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "tls12", "ring"] }
@@ -22,3 +24,5 @@ rustls-pemfile = { version = "2", optional = true }
 rcgen = { version = "0.13", optional = true }
 rustls-pki-types = { version = "1", optional = true }
 webpki-roots = { version = "0.26", optional = true }
+socket2 = { version = "0.5", optional = true }
+libc = { version = "0.2", optional = true }

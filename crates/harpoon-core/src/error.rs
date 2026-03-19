@@ -32,6 +32,9 @@ pub enum HarpoonError {
     #[error("session error: {0}")]
     Session(String),
 
+    #[error("transparent socket error: {0}")]
+    TransparentSocket(String),
+
     #[error("engine shutdown")]
     Shutdown,
 }

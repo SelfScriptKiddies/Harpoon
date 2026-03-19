@@ -6,7 +6,9 @@ use anyhow::{bail, Context, Result};
 use harpoon_core::config::CoreConfig;
 use harpoon_core::types::endpoint::{Endpoint, Protocol};
 use harpoon_core::types::filter::{Direction, Filter, FilterAction, FilterKind};
-use harpoon_core::types::rule::{DuplicateTarget, ExporterConfig, ExporterKind, Rule, TlsConfig, TlsMode};
+use harpoon_core::types::rule::{
+    DuplicateTarget, ExporterConfig, ExporterKind, Rule, TlsConfig, TlsMode, UdpSourceMode,
+};
 
 use crate::config::schema::{AppConfig, AppRule};
 
@@ -117,6 +119,12 @@ fn convert_rule(r: AppRule) -> Result<Rule> {
         None => None,
     };
 
+    let udp_source_mode = match r.udp_source_mode.as_deref() {
+        Some("preserve") => UdpSourceMode::Preserve,
+        Some("proxy") | None => UdpSourceMode::Proxy,
+        Some(other) => bail!("unknown udp_source_mode '{}' in rule '{}'", other, r.name),
+    };
+
     let idle_timeout_secs = r.idle_timeout_secs.unwrap_or(Rule::default_idle_timeout());
 
     Ok(Rule {
@@ -133,6 +141,7 @@ fn convert_rule(r: AppRule) -> Result<Rule> {
         duplicate,
         exporter,
         tls,
+        udp_source_mode,
         idle_timeout_secs,
     })
 }
@@ -211,6 +220,7 @@ mod tests {
                 duplicate: None,
                 exporter: None,
                 tls: None,
+                udp_source_mode: None,
                 idle_timeout_secs: None,
             }],
         };
@@ -239,6 +249,7 @@ mod tests {
                 duplicate: None,
                 exporter: None,
                 tls: None,
+                udp_source_mode: None,
                 idle_timeout_secs: Some(60),
             }],
         };

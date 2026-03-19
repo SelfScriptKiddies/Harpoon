@@ -1,6 +1,8 @@
 pub mod filter;
 pub mod tcp;
 pub mod udp;
+#[cfg(feature = "transparent-udp")]
+pub mod udp_transparent;
 
 use std::sync::Arc;
 
@@ -63,11 +65,10 @@ impl EngineHandle {
 
 pub async fn run(config: CoreConfig) -> Result<EngineHandle, HarpoonError> {
     let cancel = CancellationToken::new();
-    let (event_tx, _event_rx) = broadcast::channel(1024);
+    let (event_tx, _event_rx) = broadcast::channel(config.event_channel_capacity);
     let mut handles: Vec<JoinHandle<Result<(), HarpoonError>>> = Vec::new();
     let mut stats_vec = Vec::new();
 
-    // Build CA for TLS rules if any need it
     #[cfg(feature = "tls")]
     let ca: Option<Arc<CertAuthority>> = build_ca(&config)?;
 
@@ -75,7 +76,6 @@ pub async fn run(config: CoreConfig) -> Result<EngineHandle, HarpoonError> {
         let rule_stats = Arc::new(RuleStats::default());
         stats_vec.push((rule.name.clone(), rule_stats.clone()));
 
-        // Compile filters
         let compiled_filters: Vec<CompiledFilter> = rule
             .filters
             .iter()
@@ -83,9 +83,8 @@ pub async fn run(config: CoreConfig) -> Result<EngineHandle, HarpoonError> {
             .collect::<Result<Vec<_>, _>>()?;
         let filters = Arc::new(compiled_filters);
 
-        // Setup exporter if configured
         let export_tx = if let Some(ref exp_cfg) = rule.exporter {
-            let (tx, rx) = mpsc::channel(256);
+            let (tx, rx) = mpsc::channel(config.export_channel_capacity);
             let kind = exp_cfg.kind.clone();
             tokio::spawn(run_exporter(kind, rx));
             Some(tx)
@@ -98,6 +97,7 @@ pub async fn run(config: CoreConfig) -> Result<EngineHandle, HarpoonError> {
                 #[cfg(feature = "tls")]
                 let ca = ca.clone();
 
+                let tcp_nodelay = config.tcp_nodelay;
                 let h = tokio::spawn(tcp::run_tcp_rule(
                     rule,
                     rule_stats,
@@ -106,6 +106,7 @@ pub async fn run(config: CoreConfig) -> Result<EngineHandle, HarpoonError> {
                     export_tx,
                     cancel.child_token(),
                     config.buffer_size,
+                    tcp_nodelay,
                     #[cfg(feature = "tls")]
                     ca,
                 ));
@@ -138,7 +139,6 @@ pub async fn run(config: CoreConfig) -> Result<EngineHandle, HarpoonError> {
 fn build_ca(config: &CoreConfig) -> Result<Option<Arc<CertAuthority>>, HarpoonError> {
     use crate::types::rule::TlsMode;
 
-    // Find the first rule that needs TLS
     let tls_rule = config.rules.iter().find(|r| {
         r.tls
             .as_ref()

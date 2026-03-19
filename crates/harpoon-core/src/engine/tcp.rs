@@ -24,6 +24,7 @@ pub async fn run_tcp_rule(
     export_tx: Option<mpsc::Sender<Event>>,
     cancel: CancellationToken,
     buffer_size: usize,
+    tcp_nodelay: bool,
     #[cfg(feature = "tls")] ca: Option<Arc<CertAuthority>>,
 ) -> Result<(), HarpoonError> {
     let listener = TcpListener::bind(rule.listen.addr)
@@ -37,6 +38,7 @@ pub async fn run_tcp_rule(
     emit_event(
         &event_tx,
         &export_tx,
+        &stats,
         EventKind::RuleActivated {
             rule: rule.name.clone(),
         },
@@ -47,7 +49,6 @@ pub async fn run_tcp_rule(
     let rule_name = Arc::new(rule.name.clone());
     let dup_endpoint = rule.duplicate.as_ref().map(|d| d.endpoint.addr);
 
-    // Determine TLS mode
     #[cfg(feature = "tls")]
     let tls_mode = rule.tls.as_ref().map(|t| t.mode.clone());
     #[cfg(not(feature = "tls"))]
@@ -64,8 +65,11 @@ pub async fn run_tcp_rule(
                     }
                 };
 
+                // Apply TCP_NODELAY
+                let _ = client_stream.set_nodelay(tcp_nodelay);
+
                 stats.active_tcp_connections.fetch_add(1, Ordering::Relaxed);
-                emit_event(&event_tx, &export_tx, EventKind::TcpConnectionOpened {
+                emit_event(&event_tx, &export_tx, &stats, EventKind::TcpConnectionOpened {
                     rule: rule_name.to_string(),
                     client: client_addr,
                 }).await;
@@ -104,7 +108,7 @@ pub async fn run_tcp_rule(
                                         client_stream, client_addr, target_addr,
                                         dup_endpoint, &filters, &stats,
                                         &event_tx, &export_tx, &cancel,
-                                        buffer_size, &rule_name,
+                                        buffer_size, tcp_nodelay, &rule_name,
                                     ).await
                                 }
                             }
@@ -115,7 +119,7 @@ pub async fn run_tcp_rule(
                                 client_stream, client_addr, target_addr,
                                 dup_endpoint, &filters, &stats,
                                 &event_tx, &export_tx, &cancel,
-                                buffer_size, &rule_name,
+                                buffer_size, tcp_nodelay, &rule_name,
                             ).await
                         }
                     };
@@ -153,6 +157,7 @@ async fn handle_tcp_connection(
     export_tx: &Option<mpsc::Sender<Event>>,
     cancel: &CancellationToken,
     buffer_size: usize,
+    tcp_nodelay: bool,
     rule_name: &str,
 ) -> Result<(), HarpoonError> {
     let upstream = TcpStream::connect(target_addr)
@@ -161,6 +166,13 @@ async fn handle_tcp_connection(
             addr: target_addr,
             source: e,
         })?;
+
+    let _ = upstream.set_nodelay(tcp_nodelay);
+
+    // Fast path: no filters, no duplicate — use zero-copy bidirectional copy
+    if filters.is_empty() && dup_endpoint.is_none() {
+        return fast_path_proxy(client_stream, upstream, stats, cancel).await;
+    }
 
     let mut dup_stream = if let Some(dup_addr) = dup_endpoint {
         match TcpStream::connect(dup_addr).await {
@@ -202,7 +214,7 @@ async fn handle_tcp_connection(
                             } else {
                                 EventKind::FilterMatch { rule: rule_name.clone(), filter_index: idx }
                             };
-                            emit_event(&event_tx, &export_tx, kind).await;
+                            emit_event(&event_tx, &export_tx, stats, kind).await;
                         }
 
                         match action {
@@ -211,7 +223,7 @@ async fn handle_tcp_connection(
                                 continue;
                             }
                             FilterAction::TapOnly => {
-                                emit_event(&event_tx, &export_tx, EventKind::IncomingData {
+                                emit_event(&event_tx, &export_tx, stats, EventKind::IncomingData {
                                     rule: rule_name.clone(), src: client_addr, len: n,
                                 }).await;
                                 continue;
@@ -257,7 +269,7 @@ async fn handle_tcp_connection(
                             } else {
                                 EventKind::FilterMatch { rule: rule_name.clone(), filter_index: idx }
                             };
-                            emit_event(&event_tx, &export_tx, kind).await;
+                            emit_event(&event_tx, &export_tx, stats, kind).await;
                         }
 
                         match action {
@@ -266,7 +278,7 @@ async fn handle_tcp_connection(
                                 continue;
                             }
                             FilterAction::TapOnly => {
-                                emit_event(&event_tx, &export_tx, EventKind::OutgoingData {
+                                emit_event(&event_tx, &export_tx, stats, EventKind::OutgoingData {
                                     rule: rule_name.clone(), dst: client_addr, len: n,
                                 }).await;
                                 continue;
@@ -292,14 +304,35 @@ async fn handle_tcp_connection(
     Ok(())
 }
 
+/// Fast path for filterless, no-duplicate TCP proxy using copy_bidirectional
+async fn fast_path_proxy(
+    mut client: TcpStream,
+    mut upstream: TcpStream,
+    stats: &RuleStats,
+    cancel: &CancellationToken,
+) -> Result<(), HarpoonError> {
+    tokio::select! {
+        result = tokio::io::copy_bidirectional(&mut client, &mut upstream) => {
+            let (c2s, s2c) = result.map_err(HarpoonError::Io)?;
+            stats.bytes_client_to_server.fetch_add(c2s, Ordering::Relaxed);
+            stats.bytes_server_to_client.fetch_add(s2c, Ordering::Relaxed);
+            Ok(())
+        }
+        _ = cancel.cancelled() => Ok(()),
+    }
+}
+
 async fn emit_event(
     event_tx: &broadcast::Sender<Event>,
     export_tx: &Option<mpsc::Sender<Event>>,
+    stats: &RuleStats,
     kind: EventKind,
 ) {
     let event = Event::new(kind);
     let _ = event_tx.send(event.clone());
     if let Some(tx) = export_tx {
-        let _ = tx.try_send(event);
+        if tx.try_send(event).is_err() {
+            stats.export_drops.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }

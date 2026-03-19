@@ -22,11 +22,8 @@ pub struct ExporterConfig {
 
 #[derive(Debug, Clone)]
 pub enum TlsMode {
-    /// No TLS processing — forward raw bytes
     Passthrough,
-    /// Terminate TLS from client, connect to upstream in plaintext
     Terminate,
-    /// Full MITM: terminate client TLS, re-encrypt to upstream
     Mitm,
 }
 
@@ -35,6 +32,20 @@ pub struct TlsConfig {
     pub mode: TlsMode,
     pub ca_cert_path: PathBuf,
     pub ca_key_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UdpSourceMode {
+    /// Upstream sees Harpoon's IP (default, works without privileges)
+    Proxy,
+    /// Upstream sees original client IP (requires CAP_NET_ADMIN + transparent-udp feature)
+    Preserve,
+}
+
+impl Default for UdpSourceMode {
+    fn default() -> Self {
+        Self::Proxy
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +57,7 @@ pub struct Rule {
     pub duplicate: Option<DuplicateTarget>,
     pub exporter: Option<ExporterConfig>,
     pub tls: Option<TlsConfig>,
+    pub udp_source_mode: UdpSourceMode,
     pub idle_timeout_secs: u64,
 }
 

@@ -1,18 +1,18 @@
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
+use dashmap::DashMap;
 use tokio::net::UdpSocket;
-use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::engine::filter::{apply_filters, CompiledFilter};
 use crate::error::HarpoonError;
 use crate::types::event::{Event, EventKind};
 use crate::types::filter::{Direction, FilterAction};
-use crate::types::rule::Rule;
+use crate::types::rule::{Rule, UdpSourceMode};
 use crate::types::stats::RuleStats;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -48,6 +48,7 @@ pub async fn run_udp_rule(
     emit_event(
         &event_tx,
         &export_tx,
+        &stats,
         EventKind::RuleActivated {
             rule: rule.name.clone(),
         },
@@ -58,9 +59,27 @@ pub async fn run_udp_rule(
     let rule_name = Arc::new(rule.name.clone());
     let idle_timeout = std::time::Duration::from_secs(rule.idle_timeout_secs);
     let dup_endpoint = rule.duplicate.as_ref().map(|d| d.endpoint.addr);
+    let source_mode = rule.udp_source_mode.clone();
 
-    let sessions: Arc<Mutex<HashMap<SessionKey, UdpSession>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    // Pre-create persistent duplicate socket
+    let dup_socket = if let Some(dup_addr) = dup_endpoint {
+        let bind_addr: SocketAddr = if dup_addr.is_ipv4() {
+            "0.0.0.0:0".parse().unwrap()
+        } else {
+            "[::]:0".parse().unwrap()
+        };
+        match UdpSocket::bind(bind_addr).await {
+            Ok(s) => Some(Arc::new(s)),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to create duplicate socket");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let sessions: Arc<DashMap<SessionKey, UdpSession>> = Arc::new(DashMap::new());
 
     // Spawn cleanup task
     let cleanup_sessions = sessions.clone();
@@ -76,20 +95,19 @@ pub async fn run_udp_rule(
             tokio::select! {
                 _ = interval.tick() => {
                     let now = Instant::now();
-                    let mut map = cleanup_sessions.lock().await;
                     let mut expired = Vec::new();
 
-                    for (key, session) in map.iter() {
-                        if now.duration_since(session.last_activity) > idle_timeout {
-                            expired.push(key.clone());
+                    for entry in cleanup_sessions.iter() {
+                        if now.duration_since(entry.value().last_activity) > idle_timeout {
+                            expired.push(entry.key().clone());
                         }
                     }
 
                     for key in expired {
-                        if let Some(session) = map.remove(&key) {
+                        if let Some((_, session)) = cleanup_sessions.remove(&key) {
                             session.cancel.cancel();
                             cleanup_stats.active_udp_sessions.fetch_sub(1, Ordering::Relaxed);
-                            emit_event(&cleanup_event_tx, &cleanup_export_tx, EventKind::UdpSessionTimeout {
+                            emit_event(&cleanup_event_tx, &cleanup_export_tx, &cleanup_stats, EventKind::UdpSessionTimeout {
                                 rule: cleanup_rule_name.to_string(),
                                 client: key.client_addr,
                             }).await;
@@ -127,7 +145,7 @@ pub async fn run_udp_rule(
                     } else {
                         EventKind::FilterMatch { rule: rule_name.to_string(), filter_index: idx }
                     };
-                    emit_event(&event_tx, &export_tx, kind).await;
+                    emit_event(&event_tx, &export_tx, &stats, kind).await;
                 }
 
                 match action {
@@ -136,7 +154,7 @@ pub async fn run_udp_rule(
                         continue;
                     }
                     FilterAction::TapOnly => {
-                        emit_event(&event_tx, &export_tx, EventKind::IncomingData {
+                        emit_event(&event_tx, &export_tx, &stats, EventKind::IncomingData {
                             rule: rule_name.to_string(), src: client_addr, len: n,
                         }).await;
                         continue;
@@ -144,11 +162,11 @@ pub async fn run_udp_rule(
                     FilterAction::Pass => {}
                 }
 
-                let mut map = sessions.lock().await;
-
-                if !map.contains_key(&key) {
+                if !sessions.contains_key(&key) {
                     // Create new session
-                    let upstream_socket = match create_upstream_socket(target_addr).await {
+                    let upstream_socket = match create_session_socket(
+                        &source_mode, client_addr, target_addr
+                    ).await {
                         Ok(s) => Arc::new(s),
                         Err(e) => {
                             tracing::warn!(error = %e, client = %client_addr, "failed to create upstream socket");
@@ -185,7 +203,6 @@ pub async fn run_udp_rule(
 
                                     let data = &recv_buf[..n];
 
-                                    // Apply server->client filters
                                     let (action, filter_idx) = apply_filters(&recv_filters, data, &Direction::ServerToClient);
                                     if let Some(idx) = filter_idx {
                                         recv_stats.filter_matches.fetch_add(1, Ordering::Relaxed);
@@ -194,7 +211,7 @@ pub async fn run_udp_rule(
                                         } else {
                                             EventKind::FilterMatch { rule: recv_rule_name.to_string(), filter_index: idx }
                                         };
-                                        emit_event(&recv_event_tx, &recv_export_tx, kind).await;
+                                        emit_event(&recv_event_tx, &recv_export_tx, &recv_stats, kind).await;
                                     }
 
                                     match action {
@@ -202,9 +219,7 @@ pub async fn run_udp_rule(
                                             recv_stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
                                             continue;
                                         }
-                                        FilterAction::TapOnly => {
-                                            continue;
-                                        }
+                                        FilterAction::TapOnly => continue,
                                         FilterAction::Pass => {}
                                     }
 
@@ -217,9 +232,8 @@ pub async fn run_udp_rule(
                                     recv_stats.packets_server_to_client.fetch_add(1, Ordering::Relaxed);
 
                                     // Update last_activity
-                                    let mut map = recv_sessions.lock().await;
-                                    if let Some(session) = map.get_mut(&recv_key) {
-                                        session.last_activity = Instant::now();
+                                    if let Some(mut entry) = recv_sessions.get_mut(&recv_key) {
+                                        entry.last_activity = Instant::now();
                                     }
                                 }
                                 _ = recv_cancel.cancelled() => break,
@@ -232,19 +246,19 @@ pub async fn run_udp_rule(
                         last_activity: Instant::now(),
                         cancel: session_cancel,
                     };
-                    map.insert(key.clone(), session);
+                    sessions.insert(key.clone(), session);
                     stats.active_udp_sessions.fetch_add(1, Ordering::Relaxed);
 
-                    emit_event(&event_tx, &export_tx, EventKind::UdpSessionCreated {
+                    emit_event(&event_tx, &export_tx, &stats, EventKind::UdpSessionCreated {
                         rule: rule_name.to_string(),
                         client: client_addr,
                     }).await;
                 }
 
-                if let Some(session) = map.get_mut(&key) {
-                    session.last_activity = Instant::now();
+                if let Some(mut entry) = sessions.get_mut(&key) {
+                    entry.last_activity = Instant::now();
 
-                    if let Err(e) = session.upstream_socket.send(data).await {
+                    if let Err(e) = entry.upstream_socket.send(data).await {
                         tracing::debug!(error = %e, "upstream send failed");
                         continue;
                     }
@@ -252,20 +266,16 @@ pub async fn run_udp_rule(
                     stats.bytes_client_to_server.fetch_add(n as u64, Ordering::Relaxed);
                     stats.packets_client_to_server.fetch_add(1, Ordering::Relaxed);
 
-                    // Duplicate if configured
-                    if let Some(dup_addr) = dup_endpoint {
-                        if let Ok(dup_sock) = UdpSocket::bind("0.0.0.0:0").await {
-                            let _ = dup_sock.send_to(data, dup_addr).await;
-                        }
+                    // Duplicate via persistent socket
+                    if let (Some(dup_addr), Some(ref dup_sock)) = (dup_endpoint, &dup_socket) {
+                        let _ = dup_sock.send_to(data, dup_addr).await;
                     }
                 }
             }
             _ = cancel.cancelled() => {
                 tracing::info!(rule = %rule_name, "udp rule shutting down");
-                // Cancel all sessions
-                let map = sessions.lock().await;
-                for (_, session) in map.iter() {
-                    session.cancel.cancel();
+                for entry in sessions.iter() {
+                    entry.value().cancel.cancel();
                 }
                 break;
             }
@@ -275,25 +285,58 @@ pub async fn run_udp_rule(
     Ok(())
 }
 
-async fn create_upstream_socket(target_addr: SocketAddr) -> Result<UdpSocket, std::io::Error> {
+async fn create_session_socket(
+    source_mode: &UdpSourceMode,
+    client_addr: SocketAddr,
+    target_addr: SocketAddr,
+) -> Result<UdpSocket, HarpoonError> {
+    match source_mode {
+        UdpSourceMode::Proxy => create_upstream_socket(target_addr).await,
+        UdpSourceMode::Preserve => {
+            #[cfg(feature = "transparent-udp")]
+            {
+                let std_sock = super::udp_transparent::create_transparent_upstream_socket(
+                    client_addr, target_addr,
+                )?;
+                UdpSocket::from_std(std_sock).map_err(|e| {
+                    HarpoonError::TransparentSocket(format!("tokio conversion: {e}"))
+                })
+            }
+            #[cfg(not(feature = "transparent-udp"))]
+            {
+                let _ = client_addr;
+                Err(HarpoonError::Config(
+                    "transparent-udp feature not enabled; cannot use preserve source mode".into(),
+                ))
+            }
+        }
+    }
+}
+
+async fn create_upstream_socket(target_addr: SocketAddr) -> Result<UdpSocket, HarpoonError> {
     let bind_addr: SocketAddr = if target_addr.is_ipv4() {
         "0.0.0.0:0".parse().unwrap()
     } else {
         "[::]:0".parse().unwrap()
     };
-    let socket = UdpSocket::bind(bind_addr).await?;
-    socket.connect(target_addr).await?;
+    let socket = UdpSocket::bind(bind_addr)
+        .await
+        .map_err(HarpoonError::Io)?;
+    socket.connect(target_addr).await.map_err(HarpoonError::Io)?;
     Ok(socket)
 }
 
 async fn emit_event(
     event_tx: &broadcast::Sender<Event>,
     export_tx: &Option<mpsc::Sender<Event>>,
+    stats: &RuleStats,
     kind: EventKind,
 ) {
     let event = Event::new(kind);
     let _ = event_tx.send(event.clone());
     if let Some(tx) = export_tx {
-        let _ = tx.try_send(event);
+        if tx.try_send(event).is_err() {
+            stats.export_drops.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
