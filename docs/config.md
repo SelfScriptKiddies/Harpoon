@@ -19,25 +19,40 @@ Requires building with `--features web`.
 ```toml
 [global]
 web_bind = "127.0.0.1:8888"
+web_password = "my-secret"      # optional — auto-generated if omitted
 ```
 
 | Field | Type | Description |
 |---|---|---|
 | `web_bind` | `string` | Address and port for the web server. Omit to disable. |
+| `web_password` | `string` | Password for web UI login (username is always `admin`). If omitted, a random password is generated and printed to the log on startup. |
 
-When set, Harpoon starts an HTTP server alongside the engine. Open `http://<web_bind>/` in a browser to see the dashboard.
+### Authentication
 
-API endpoints:
+The web UI requires authentication. On login page enter:
+- **Username:** `admin`
+- **Password:** from `web_password` in config, or auto-generated (check startup log)
 
-| Endpoint | Description |
-|---|---|
-| `GET /` | HTML dashboard (auto-refreshes every 3s) |
-| `GET /api/status` | JSON: running, uptime, rules count, config path |
-| `GET /api/stats` | JSON array: per-rule bytes, packets, connections, sessions, drops |
-| `GET /api/rules` | JSON array: rule name, protocol, listen, target, filter count |
-| `GET /api/events` | JSON array: last 100 events with timestamp, kind, detail |
+A session token is returned on successful login and stored in the browser. All API endpoints (except `/api/auth/login`) require `Authorization: Bearer <token>` header.
 
-The web server binds only when the `web` feature is compiled in **and** `web_bind` is present in the config. If the feature is not compiled in, the field is silently ignored.
+### API endpoints
+
+| Endpoint | Method | Auth | Description |
+|---|---|---|---|
+| `/` | GET | No | HTML dashboard |
+| `/api/auth/login` | POST | No | Login, returns `{ "token": "..." }` |
+| `/api/status` | GET | Yes | Daemon status |
+| `/api/stats` | GET | Yes | Per-rule traffic statistics |
+| `/api/rules` | GET | Yes | Active rule list |
+| `/api/events` | GET | Yes | Recent events (last 200) |
+| `/api/reload` | POST | Yes | Reload configuration |
+| `/api/stop` | POST | Yes | Shutdown daemon |
+
+### Pages
+
+The dashboard includes 6 pages: Overview, Rules (with detail inspector), Sessions, Events (with pause/clear), Config, System.
+
+The web server starts only when the `web` feature is compiled in **and** `web_bind` is set in config.
 
 ## Rules
 

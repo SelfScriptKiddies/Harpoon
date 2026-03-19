@@ -2,7 +2,8 @@
 buffer_size = 8192
 udp_max_datagram = 65507
 shutdown_timeout_secs = 5
-# web_bind = "127.0.0.1:8888"  # web UI (requires --features web)
+# web_bind = "127.0.0.1:8888"    # web UI (requires --features web)
+# web_password = "changeme"      # omit to auto-generate (printed to log)
 
 [[rules]]
 name = "web-proxy"

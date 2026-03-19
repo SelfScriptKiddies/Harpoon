@@ -1,29 +1,48 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::http::StatusCode;
-use axum::response::Json;
-use axum::routing::get;
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{Html, Json};
+use axum::routing::{get, post};
 use axum::Router;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
 
-use crate::control::proto::{RuleInfo, RuleStatsInfo, StatusInfo};
+use crate::control::proto::{EventInfo, RuleInfo, RuleStatsInfo, StatusInfo};
 use crate::control::server::ControlState;
 
-type AppState = Arc<RwLock<ControlState>>;
+const INDEX_HTML: &str = include_str!("assets/index.html");
+
+pub struct WebState {
+    pub control: Arc<RwLock<ControlState>>,
+    pub password: String,
+    pub tokens: Mutex<HashSet<String>>,
+}
 
 pub async fn run_web_server(
     bind_addr: std::net::SocketAddr,
-    state: AppState,
+    control: Arc<RwLock<ControlState>>,
+    password: String,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
+    let state = Arc::new(WebState {
+        control,
+        password,
+        tokens: Mutex::new(HashSet::new()),
+    });
+
     let app = Router::new()
+        // Public
+        .route("/api/auth/login", post(api_login))
+        // Protected
         .route("/api/status", get(api_status))
         .route("/api/stats", get(api_stats))
         .route("/api/rules", get(api_rules))
         .route("/api/events", get(api_events))
+        .route("/api/reload", post(api_reload))
+        .route("/api/stop", post(api_stop))
         .route("/", get(index_page))
         .layer(CorsLayer::permissive())
         .with_state(state);
@@ -40,21 +59,78 @@ pub async fn run_web_server(
     Ok(())
 }
 
-async fn api_status(State(state): State<AppState>) -> Json<StatusInfo> {
-    let s = state.read().await;
+fn check_auth(headers: &HeaderMap, tokens: &HashSet<String>) -> bool {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|t| tokens.contains(t))
+        .unwrap_or(false)
+}
+
+fn gen_token() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{:x}{:x}", ts, std::process::id())
+}
+
+#[derive(serde::Deserialize)]
+struct LoginReq {
+    username: String,
+    password: String,
+}
+
+#[derive(serde::Serialize)]
+struct LoginResp {
+    token: String,
+}
+
+async fn api_login(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<LoginReq>,
+) -> Result<Json<LoginResp>, StatusCode> {
+    if req.username == "admin" && req.password == state.password {
+        let token = gen_token();
+        state.tokens.lock().await.insert(token.clone());
+        Ok(Json(LoginResp { token }))
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
+    }
+}
+
+macro_rules! require_auth {
+    ($state:expr, $headers:expr) => {{
+        let tokens = $state.tokens.lock().await;
+        if !check_auth(&$headers, &tokens) {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    }};
+}
+
+async fn api_status(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+) -> Result<Json<StatusInfo>, StatusCode> {
+    require_auth!(state, headers);
+    let s = state.control.read().await;
     let uptime = s.start_time.elapsed().as_secs();
-    Json(StatusInfo {
+    Ok(Json(StatusInfo {
         running: s.engine_handle.is_some(),
         uptime_secs: uptime,
         rules_count: s.rules_info.len(),
         config_path: s.config_path.display().to_string(),
-    })
+    }))
 }
 
 async fn api_stats(
-    State(state): State<AppState>,
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
 ) -> Result<Json<Vec<RuleStatsInfo>>, StatusCode> {
-    let s = state.read().await;
+    require_auth!(state, headers);
+    let s = state.control.read().await;
     match &s.engine_handle {
         Some(handle) => {
             let stats: Vec<RuleStatsInfo> = handle
@@ -64,81 +140,54 @@ async fn api_stats(
                 .collect();
             Ok(Json(stats))
         }
-        None => Err(StatusCode::SERVICE_UNAVAILABLE),
+        None => Ok(Json(vec![])),
     }
 }
 
-async fn api_rules(State(state): State<AppState>) -> Json<Vec<RuleInfo>> {
-    let s = state.read().await;
-    Json(s.rules_info.clone())
+async fn api_rules(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<RuleInfo>>, StatusCode> {
+    require_auth!(state, headers);
+    let s = state.control.read().await;
+    Ok(Json(s.rules_info.clone()))
 }
 
 async fn api_events(
-    State(state): State<AppState>,
-) -> Json<Vec<crate::control::proto::EventInfo>> {
-    let s = state.read().await;
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<EventInfo>>, StatusCode> {
+    require_auth!(state, headers);
+    let s = state.control.read().await;
     let events = s.recent_events.lock().await;
-    let n = 100.min(events.len());
+    let n = 200.min(events.len());
     let tail = events[events.len() - n..].to_vec();
-    Json(tail)
+    Ok(Json(tail))
 }
 
-async fn index_page() -> axum::response::Html<&'static str> {
-    axum::response::Html(
-        r#"<!DOCTYPE html>
-<html>
-<head>
-    <title>Harpoon</title>
-    <style>
-        body { font-family: monospace; margin: 2em; background: #1a1a2e; color: #e0e0e0; }
-        h1 { color: #0f3460; }
-        .section { margin: 1em 0; padding: 1em; background: #16213e; border-radius: 8px; }
-        table { border-collapse: collapse; width: 100%; }
-        th, td { padding: 0.4em 1em; text-align: left; border-bottom: 1px solid #333; }
-        th { color: #e94560; }
-        .status { color: #0f3460; font-weight: bold; }
-        #refresh { cursor: pointer; padding: 0.5em 1em; background: #e94560; color: white; border: none; border-radius: 4px; }
-    </style>
-</head>
-<body>
-    <h1>Harpoon Dashboard</h1>
-    <button id="refresh" onclick="refresh()">Refresh</button>
-
-    <div class="section" id="status-section"><h2>Status</h2><div id="status">Loading...</div></div>
-    <div class="section" id="rules-section"><h2>Rules</h2><div id="rules">Loading...</div></div>
-    <div class="section" id="stats-section"><h2>Stats</h2><div id="stats">Loading...</div></div>
-    <div class="section" id="events-section"><h2>Recent Events</h2><div id="events">Loading...</div></div>
-
-    <script>
-    async function refresh() {
-        try {
-            const status = await (await fetch('/api/status')).json();
-            document.getElementById('status').innerHTML =
-                `Running: ${status.running} | Uptime: ${status.uptime_secs}s | Rules: ${status.rules_count} | Config: ${status.config_path}`;
-
-            const rules = await (await fetch('/api/rules')).json();
-            let rt = '<table><tr><th>Name</th><th>Proto</th><th>Listen</th><th>Target</th><th>Filters</th></tr>';
-            rules.forEach(r => { rt += `<tr><td>${r.name}</td><td>${r.protocol}</td><td>${r.listen}</td><td>${r.target}</td><td>${r.filters_count}</td></tr>`; });
-            rt += '</table>';
-            document.getElementById('rules').innerHTML = rt;
-
-            const stats = await (await fetch('/api/stats')).json();
-            let st = '<table><tr><th>Rule</th><th>Bytes C→S</th><th>Bytes S→C</th><th>Pkts C→S</th><th>Pkts S→C</th><th>TCP</th><th>UDP</th><th>Dropped</th></tr>';
-            stats.forEach(s => { st += `<tr><td>${s.rule_name}</td><td>${s.bytes_client_to_server}</td><td>${s.bytes_server_to_client}</td><td>${s.packets_client_to_server}</td><td>${s.packets_server_to_client}</td><td>${s.active_tcp_connections}</td><td>${s.active_udp_sessions}</td><td>${s.dropped_packets}</td></tr>`; });
-            st += '</table>';
-            document.getElementById('stats').innerHTML = st;
-
-            const events = await (await fetch('/api/events')).json();
-            let et = '<table><tr><th>Time</th><th>Kind</th><th>Detail</th></tr>';
-            events.slice(-20).reverse().forEach(e => { et += `<tr><td>${new Date(e.timestamp_ms).toLocaleTimeString()}</td><td>${e.kind}</td><td>${e.detail}</td></tr>`; });
-            et += '</table>';
-            document.getElementById('events').innerHTML = et;
-        } catch(e) { console.error(e); }
+async fn api_reload(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_auth!(state, headers);
+    let s = state.control.read().await;
+    let path = s.config_path.clone();
+    match s.reload_tx.try_send(path) {
+        Ok(_) => Ok(Json(serde_json::json!({"ok": true}))),
+        Err(_) => Ok(Json(serde_json::json!({"ok": false, "error": "reload already in progress"}))),
     }
-    refresh();
-    setInterval(refresh, 3000);
-    </script>
-</body>
-</html>"#,
-    )
+}
+
+async fn api_stop(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_auth!(state, headers);
+    let s = state.control.read().await;
+    s.cancel.cancel();
+    Ok(Json(serde_json::json!({"ok": true})))
+}
+
+async fn index_page() -> Html<&'static str> {
+    Html(INDEX_HTML)
 }

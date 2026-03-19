@@ -15,6 +15,8 @@ pub struct GlobalConfig {
     pub shutdown_timeout_secs: Option<u64>,
     #[allow(dead_code)]
     pub web_bind: Option<String>,
+    #[allow(dead_code)]
+    pub web_password: Option<String>,
     #[serde(default)]
     pub nft: NftConfig,
 }

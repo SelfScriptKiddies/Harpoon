@@ -45,9 +45,11 @@ async fn run_engine_loop(config_path: PathBuf, socket_path: &std::path::Path) ->
     // Apply nftables rules if configured
     let (nft_active, tproxy_mark) = apply_nft_config(&app_config)?;
 
-    // Save web bind before consuming app_config
+    // Save web settings before consuming app_config
     #[cfg(feature = "web")]
     let _web_bind = app_config.global.web_bind.clone();
+    #[cfg(feature = "web")]
+    let _web_password = app_config.global.web_password.clone();
 
     let core_config = convert(app_config).context("converting config")?;
     let rules_info = build_rules_info(&core_config);
@@ -86,10 +88,15 @@ async fn run_engine_loop(config_path: PathBuf, socket_path: &std::path::Path) ->
     if let Some(ref web_bind) = _web_bind {
         let web_addr: std::net::SocketAddr = web_bind.parse()
             .with_context(|| format!("invalid web_bind address: {web_bind}"))?;
+        let web_password = _web_password.unwrap_or_else(|| {
+            let generated = gen_password();
+            tracing::info!("Web UI credentials — login: admin, password: {generated}");
+            generated
+        });
         let web_state = control_state.clone();
         let web_cancel = cancel.child_token();
         tokio::spawn(async move {
-            if let Err(e) = crate::ui::web::server::run_web_server(web_addr, web_state, web_cancel).await {
+            if let Err(e) = crate::ui::web::server::run_web_server(web_addr, web_state, web_password, web_cancel).await {
                 tracing::error!(error = %e, "web server error");
             }
         });
@@ -275,6 +282,17 @@ fn apply_nft_config(app_config: &AppConfig) -> Result<(bool, Option<u32>)> {
 
     tracing::info!(rules = nft_rules.len(), "nftables rules applied");
     Ok((true, tproxy_mark))
+}
+
+#[cfg(feature = "web")]
+fn gen_password() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let seed = ts ^ (std::process::id() as u128) ^ 0xDEAD_BEEF;
+    format!("{:016x}", seed)
 }
 
 fn daemonize(pid_file: &std::path::Path) -> Result<()> {

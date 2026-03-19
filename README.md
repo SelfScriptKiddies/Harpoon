@@ -100,6 +100,7 @@ cargo build --release --features web
 ```toml
 [global]
 web_bind = "127.0.0.1:8888"
+# web_password = "my-secret"   # optional, auto-generated if omitted
 ```
 
 **3. Start harpoon:**
@@ -108,25 +109,38 @@ web_bind = "127.0.0.1:8888"
 ./target/release/harpoon run -c config.toml
 ```
 
-**4. Open in browser:**
+If `web_password` is not set, a random password is generated and printed to the log:
+
+```
+INFO harpoon: Web UI credentials — login: admin, password: 3a7f1b2c9e4d8f01
+```
+
+**4. Open in browser and log in:**
 
 ```
 http://127.0.0.1:8888
 ```
 
-The dashboard auto-refreshes every 3 seconds and shows:
-- Status (uptime, rule count, config path)
-- Active rules (protocol, listen/target addresses, filter count)
-- Live stats (bytes, packets, connections, sessions, drops)
-- Recent events (timestamps, event types, details)
+Login: `admin`, password: from config or auto-generated.
 
-REST API endpoints are also available:
+**Pages:**
+- **Overview** — daemon status, traffic summary cards, rules table, per-rule stats, recent events
+- **Rules** — rule list with click-to-inspect detail panel (stats, config, filters)
+- **Sessions** — active TCP connections and UDP sessions per rule
+- **Events** — live event stream with pause/resume and clear
+- **Config** — loaded config path, effective rules, reload button
+- **System** — version, uptime, active features
+
+**REST API** (requires `Authorization: Bearer <token>` header):
+- `POST /api/auth/login` — get session token
 - `GET /api/status` — daemon status
 - `GET /api/stats` — per-rule traffic stats
 - `GET /api/rules` — active rule list
-- `GET /api/events` — recent events (last 100)
+- `GET /api/events` — recent events (last 200)
+- `POST /api/reload` — reload config
+- `POST /api/stop` — shutdown daemon
 
-By default `web_bind` should point to `127.0.0.1` for security. To expose externally, use `0.0.0.0:8888` (not recommended without additional access control).
+Bind to `127.0.0.1` for security. Use `0.0.0.0` only behind a firewall.
 
 ## Optional Features
 

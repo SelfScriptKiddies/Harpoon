@@ -1,0 +1,583 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Harpoon</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+:root {
+  --bg-0: #0B0F10; --bg-1: #11161A; --bg-2: #161C21; --bg-3: #1B2329; --bg-4: #232D34;
+  --accent: #8FE36A; --accent-2: #5CCB7B; --accent-strong: #A6F77B;
+  --ok: #70D98A; --warn: #E6C15A; --err: #E26D6D; --info: #6FAFE8; --muted: #6E7A84;
+  --text: #E6EDF3; --text-2: #A9B4BC; --text-3: #7F8A93; --text-4: #5C6770;
+  --font: 'Inter', system-ui, sans-serif; --mono: 'JetBrains Mono', monospace;
+  --radius: 12px; --radius-sm: 8px;
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family:var(--font); background:var(--bg-0); color:var(--text); font-size:13px; line-height:1.5; height:100vh; overflow:hidden; }
+a { color:var(--accent); text-decoration:none; }
+::-webkit-scrollbar { width:6px; } ::-webkit-scrollbar-track { background:var(--bg-1); } ::-webkit-scrollbar-thumb { background:var(--bg-4); border-radius:3px; }
+
+/* LOGIN */
+#login-page { display:flex; align-items:center; justify-content:center; height:100vh; background:var(--bg-0); }
+.login-box { background:var(--bg-2); border:1px solid var(--bg-4); border-radius:var(--radius); padding:40px; width:360px; }
+.login-box h1 { font-size:22px; font-weight:700; margin-bottom:6px; color:var(--accent); font-family:var(--mono); }
+.login-box p { color:var(--text-3); margin-bottom:24px; font-size:12px; }
+.login-box label { display:block; font-size:11px; color:var(--text-3); margin-bottom:4px; text-transform:uppercase; letter-spacing:.5px; }
+.login-box input { width:100%; padding:10px 12px; background:var(--bg-1); border:1px solid var(--bg-4); border-radius:var(--radius-sm); color:var(--text); font-family:var(--mono); font-size:13px; margin-bottom:16px; outline:none; }
+.login-box input:focus { border-color:var(--accent); }
+.login-box button { width:100%; padding:10px; background:var(--accent); color:var(--bg-0); border:none; border-radius:var(--radius-sm); font-weight:600; font-size:13px; cursor:pointer; }
+.login-box button:hover { background:var(--accent-strong); }
+.login-error { color:var(--err); font-size:12px; margin-bottom:12px; display:none; }
+
+/* LAYOUT */
+#app { display:none; height:100vh; grid-template-columns:240px 1fr; grid-template-rows:56px 1fr; }
+.sidebar { grid-row:1/3; background:var(--bg-1); border-right:1px solid var(--bg-4); display:flex; flex-direction:column; overflow-y:auto; }
+.sidebar-logo { padding:16px 20px; font-family:var(--mono); font-size:16px; font-weight:700; color:var(--accent); border-bottom:1px solid var(--bg-4); letter-spacing:1px; }
+.sidebar-nav { flex:1; padding:8px 0; }
+.nav-item { display:flex; align-items:center; gap:10px; padding:10px 20px; color:var(--text-2); cursor:pointer; font-size:13px; transition:all .15s; border-left:3px solid transparent; }
+.nav-item:hover { background:var(--bg-2); color:var(--text); }
+.nav-item.active { color:var(--accent); background:var(--bg-2); border-left-color:var(--accent); }
+.nav-item svg { width:16px; height:16px; flex-shrink:0; }
+.sidebar-footer { padding:12px 20px; border-top:1px solid var(--bg-4); font-size:11px; color:var(--text-4); }
+.sidebar-footer .ver { font-family:var(--mono); color:var(--text-3); }
+
+.topbar { background:var(--bg-1); border-bottom:1px solid var(--bg-4); display:flex; align-items:center; padding:0 24px; gap:16px; }
+.topbar-status { display:flex; align-items:center; gap:8px; }
+.status-dot { width:8px; height:8px; border-radius:50%; }
+.status-dot.ok { background:var(--ok); box-shadow:0 0 6px var(--ok); }
+.status-dot.err { background:var(--err); box-shadow:0 0 6px var(--err); }
+.topbar-chips { display:flex; gap:12px; margin-left:auto; }
+.chip { display:flex; align-items:center; gap:6px; padding:4px 10px; background:var(--bg-2); border:1px solid var(--bg-4); border-radius:999px; font-size:11px; font-family:var(--mono); color:var(--text-2); }
+.chip .val { color:var(--accent); font-weight:600; }
+.topbar-actions { display:flex; gap:8px; }
+.btn { padding:6px 14px; border-radius:var(--radius-sm); border:1px solid var(--bg-4); background:var(--bg-2); color:var(--text-2); font-size:12px; cursor:pointer; transition:all .15s; font-family:var(--font); }
+.btn:hover { background:var(--bg-3); color:var(--text); }
+.btn-accent { background:var(--accent); color:var(--bg-0); border-color:var(--accent); font-weight:600; }
+.btn-accent:hover { background:var(--accent-strong); }
+.btn-danger { border-color:var(--err); color:var(--err); }
+.btn-danger:hover { background:rgba(226,109,109,.15); }
+
+.main { overflow-y:auto; padding:24px; background:var(--bg-0); }
+.page { display:none; }
+.page.active { display:block; }
+
+/* CARDS */
+.cards { display:grid; grid-template-columns:repeat(auto-fill, minmax(220px, 1fr)); gap:16px; margin-bottom:24px; }
+.card { background:var(--bg-2); border:1px solid var(--bg-4); border-radius:var(--radius); padding:16px; }
+.card-label { font-size:11px; color:var(--text-3); text-transform:uppercase; letter-spacing:.5px; margin-bottom:4px; }
+.card-value { font-size:22px; font-weight:700; font-family:var(--mono); color:var(--text); }
+.card-value.ok { color:var(--ok); }
+.card-value.warn { color:var(--warn); }
+.card-value.err { color:var(--err); }
+.card-sub { font-size:11px; color:var(--text-3); margin-top:4px; font-family:var(--mono); }
+
+/* SECTION */
+.section { margin-bottom:24px; }
+.section-title { font-size:16px; font-weight:600; margin-bottom:12px; display:flex; align-items:center; gap:8px; }
+.section-title .count { background:var(--bg-3); color:var(--text-3); padding:2px 8px; border-radius:999px; font-size:11px; font-family:var(--mono); }
+
+/* TABLES */
+.tbl-wrap { overflow-x:auto; border:1px solid var(--bg-4); border-radius:var(--radius); background:var(--bg-2); }
+table { width:100%; border-collapse:collapse; }
+th { padding:10px 14px; text-align:left; font-size:11px; text-transform:uppercase; letter-spacing:.5px; color:var(--text-3); background:var(--bg-3); border-bottom:1px solid var(--bg-4); white-space:nowrap; position:sticky; top:0; }
+td { padding:8px 14px; border-bottom:1px solid var(--bg-4); font-size:12px; white-space:nowrap; }
+tr:last-child td { border-bottom:none; }
+tr:hover td { background:var(--bg-3); }
+.mono { font-family:var(--mono); }
+
+/* BADGES */
+.badge { display:inline-block; padding:2px 8px; border-radius:999px; font-size:10px; font-weight:600; text-transform:uppercase; letter-spacing:.3px; }
+.badge-tcp { background:rgba(111,175,232,.15); color:var(--info); }
+.badge-udp { background:rgba(143,227,106,.15); color:var(--accent); }
+.badge-ok { background:rgba(112,217,138,.15); color:var(--ok); }
+.badge-warn { background:rgba(230,193,90,.15); color:var(--warn); }
+.badge-err { background:rgba(226,109,109,.15); color:var(--err); }
+.badge-muted { background:rgba(110,122,132,.15); color:var(--muted); }
+.badge-tls { background:rgba(166,247,123,.15); color:var(--accent-strong); }
+
+/* EVENTS STREAM */
+.event-row { display:grid; grid-template-columns:140px 140px 1fr; gap:8px; padding:6px 14px; border-bottom:1px solid var(--bg-4); font-size:12px; font-family:var(--mono); }
+.event-row:hover { background:var(--bg-3); }
+.event-time { color:var(--text-3); }
+.event-kind { color:var(--info); }
+.event-detail { color:var(--text-2); overflow:hidden; text-overflow:ellipsis; }
+
+/* EMPTY */
+.empty { text-align:center; padding:48px 24px; color:var(--text-4); }
+.empty-icon { font-size:32px; margin-bottom:8px; }
+.empty-text { font-size:14px; }
+
+/* DETAIL PANEL */
+.detail { background:var(--bg-2); border:1px solid var(--bg-4); border-radius:var(--radius); padding:20px; margin-bottom:24px; }
+.detail h3 { font-size:14px; margin-bottom:12px; color:var(--accent); }
+.detail-row { display:flex; gap:12px; margin-bottom:6px; font-size:12px; }
+.detail-key { color:var(--text-3); min-width:140px; flex-shrink:0; }
+.detail-val { color:var(--text); font-family:var(--mono); word-break:break-all; }
+
+/* TOAST */
+.toast-area { position:fixed; bottom:20px; right:20px; z-index:9999; display:flex; flex-direction:column; gap:8px; }
+.toast { padding:10px 16px; background:var(--bg-2); border:1px solid var(--bg-4); border-radius:var(--radius-sm); font-size:12px; color:var(--text); animation:fadeIn .2s; box-shadow:0 4px 12px rgba(0,0,0,.4); }
+.toast.ok { border-left:3px solid var(--ok); }
+.toast.err { border-left:3px solid var(--err); }
+@keyframes fadeIn { from{opacity:0;transform:translateY(10px)} to{opacity:1;transform:translateY(0)} }
+</style>
+</head>
+<body>
+
+<!-- LOGIN PAGE -->
+<div id="login-page">
+  <div class="login-box">
+    <h1>HARPOON</h1>
+    <p>Traffic analysis proxy — authenticate to continue</p>
+    <div class="login-error" id="login-error">Invalid credentials</div>
+    <label>Username</label>
+    <input type="text" id="login-user" value="admin" autocomplete="username">
+    <label>Password</label>
+    <input type="password" id="login-pass" autocomplete="current-password" autofocus>
+    <button onclick="doLogin()">Authenticate</button>
+  </div>
+</div>
+
+<!-- MAIN APP -->
+<div id="app">
+  <div class="sidebar">
+    <div class="sidebar-logo">HARPOON</div>
+    <div class="sidebar-nav">
+      <div class="nav-item active" data-page="overview" onclick="nav(this)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+        Overview
+      </div>
+      <div class="nav-item" data-page="rules" onclick="nav(this)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16M4 12h16M4 18h10"/></svg>
+        Rules
+      </div>
+      <div class="nav-item" data-page="sessions" onclick="nav(this)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M8 12h8M12 8v8"/></svg>
+        Sessions
+      </div>
+      <div class="nav-item" data-page="events" onclick="nav(this)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+        Events
+      </div>
+      <div class="nav-item" data-page="config" onclick="nav(this)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 01-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
+        Config
+      </div>
+      <div class="nav-item" data-page="system" onclick="nav(this)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+        System
+      </div>
+    </div>
+    <div class="sidebar-footer">
+      <div class="ver">harpoon v0.1.0</div>
+      <div style="margin-top:8px;display:flex;gap:6px;">
+        <button class="btn" style="font-size:11px;padding:4px 10px;" onclick="doReload()">Reload</button>
+        <button class="btn btn-danger" style="font-size:11px;padding:4px 10px;" onclick="doStop()">Shutdown</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="topbar">
+    <div class="topbar-status">
+      <div class="status-dot" id="status-dot"></div>
+      <span id="status-label" style="font-weight:600;font-size:12px;">—</span>
+    </div>
+    <div class="topbar-chips">
+      <div class="chip">Rules <span class="val" id="chip-rules">0</span></div>
+      <div class="chip">TCP <span class="val" id="chip-tcp">0</span></div>
+      <div class="chip">UDP <span class="val" id="chip-udp">0</span></div>
+      <div class="chip">Uptime <span class="val" id="chip-uptime">0s</span></div>
+    </div>
+    <div class="topbar-actions">
+      <button class="btn" onclick="refreshAll()">Refresh</button>
+      <button class="btn" onclick="doLogout()">Logout</button>
+    </div>
+  </div>
+
+  <div class="main">
+    <!-- OVERVIEW -->
+    <div class="page active" id="page-overview">
+      <div class="section-title">Overview</div>
+      <div class="cards" id="overview-cards"></div>
+      <div class="section">
+        <div class="section-title">Rules <span class="count" id="rules-count">0</span></div>
+        <div class="tbl-wrap"><table><thead><tr>
+          <th>Name</th><th>Proto</th><th>Listen</th><th>Target</th><th>Filters</th><th>Dup</th><th>Export</th>
+        </tr></thead><tbody id="overview-rules"></tbody></table></div>
+      </div>
+      <div class="section">
+        <div class="section-title">Per-Rule Stats</div>
+        <div class="tbl-wrap"><table><thead><tr>
+          <th>Rule</th><th>Bytes C→S</th><th>Bytes S→C</th><th>Pkts C→S</th><th>Pkts S→C</th><th>TCP</th><th>UDP</th><th>Dropped</th><th>Flt Hits</th><th>Exp Drops</th>
+        </tr></thead><tbody id="overview-stats"></tbody></table></div>
+      </div>
+      <div class="section">
+        <div class="section-title">Recent Events <span class="count" id="events-count">0</span></div>
+        <div class="tbl-wrap" style="max-height:300px;overflow-y:auto;" id="overview-events-wrap">
+          <div id="overview-events"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- RULES -->
+    <div class="page" id="page-rules">
+      <div class="section-title">Rules <span class="count" id="rules-count2">0</span></div>
+      <div class="tbl-wrap"><table><thead><tr>
+        <th>Name</th><th>Protocol</th><th>Listen</th><th>Target</th><th>Filters</th><th>Duplicate</th><th>Exporter</th>
+      </tr></thead><tbody id="rules-table"></tbody></table></div>
+      <div id="rule-detail" style="margin-top:16px;"></div>
+    </div>
+
+    <!-- SESSIONS -->
+    <div class="page" id="page-sessions">
+      <div class="section-title">Active Sessions</div>
+      <div class="cards" id="session-cards"></div>
+      <div class="section">
+        <div class="section-title">Per-Rule Breakdown</div>
+        <div class="tbl-wrap"><table><thead><tr>
+          <th>Rule</th><th>TCP Connections</th><th>UDP Sessions</th><th>Bytes C→S</th><th>Bytes S→C</th>
+        </tr></thead><tbody id="sessions-table"></tbody></table></div>
+      </div>
+    </div>
+
+    <!-- EVENTS -->
+    <div class="page" id="page-events">
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;">
+        <div class="section-title" style="margin-bottom:0;">Events</div>
+        <button class="btn" id="events-pause-btn" onclick="toggleEventsPause()">Pause</button>
+        <button class="btn" onclick="clearEvents()">Clear</button>
+      </div>
+      <div class="tbl-wrap" style="max-height:calc(100vh - 160px);overflow-y:auto;" id="events-stream-wrap">
+        <div id="events-stream"></div>
+      </div>
+    </div>
+
+    <!-- CONFIG -->
+    <div class="page" id="page-config">
+      <div class="section-title">Configuration</div>
+      <div class="detail">
+        <h3>Loaded Config</h3>
+        <div class="detail-row"><span class="detail-key">Path</span><span class="detail-val" id="cfg-path">—</span></div>
+      </div>
+      <div style="display:flex;gap:8px;margin-bottom:16px;">
+        <button class="btn btn-accent" onclick="doReload()">Reload Config</button>
+      </div>
+      <div class="section-title">Effective Rules</div>
+      <div class="tbl-wrap"><table><thead><tr>
+        <th>Name</th><th>Protocol</th><th>Listen</th><th>Target</th><th>Filters</th>
+      </tr></thead><tbody id="config-rules"></tbody></table></div>
+    </div>
+
+    <!-- SYSTEM -->
+    <div class="page" id="page-system">
+      <div class="section-title">System</div>
+      <div class="cards" id="system-cards"></div>
+      <div class="section" style="margin-top:16px;">
+        <div class="section-title">Features</div>
+        <div id="system-features" style="display:flex;gap:8px;flex-wrap:wrap;"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="toast-area" id="toast-area"></div>
+
+<script>
+let token = localStorage.getItem('harpoon_token') || '';
+let eventsPaused = false;
+let allEvents = [];
+
+async function api(path, opts) {
+  const h = { 'Content-Type': 'application/json' };
+  if (token) h['Authorization'] = 'Bearer ' + token;
+  const r = await fetch(path, { ...opts, headers: { ...h, ...(opts?.headers||{}) } });
+  if (r.status === 401) { showLogin(); throw new Error('unauthorized'); }
+  return r;
+}
+
+function showLogin() {
+  document.getElementById('login-page').style.display = 'flex';
+  document.getElementById('app').style.display = 'none';
+  token = '';
+  localStorage.removeItem('harpoon_token');
+}
+
+function showApp() {
+  document.getElementById('login-page').style.display = 'none';
+  document.getElementById('app').style.display = 'grid';
+}
+
+async function doLogin() {
+  const user = document.getElementById('login-user').value;
+  const pass = document.getElementById('login-pass').value;
+  try {
+    const r = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: user, password: pass })
+    });
+    if (!r.ok) {
+      document.getElementById('login-error').style.display = 'block';
+      return;
+    }
+    const data = await r.json();
+    token = data.token;
+    localStorage.setItem('harpoon_token', token);
+    document.getElementById('login-error').style.display = 'none';
+    showApp();
+    refreshAll();
+  } catch(e) {
+    document.getElementById('login-error').style.display = 'block';
+  }
+}
+
+function doLogout() {
+  showLogin();
+}
+
+document.getElementById('login-pass').addEventListener('keydown', e => { if(e.key==='Enter') doLogin(); });
+
+// NAV
+function nav(el) {
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  el.classList.add('active');
+  const page = el.dataset.page;
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.getElementById('page-' + page).classList.add('active');
+}
+
+// TOAST
+function toast(msg, type='ok') {
+  const area = document.getElementById('toast-area');
+  const t = document.createElement('div');
+  t.className = 'toast ' + type;
+  t.textContent = msg;
+  area.appendChild(t);
+  setTimeout(() => t.remove(), 3000);
+}
+
+// DATA
+async function refreshAll() {
+  try {
+    const [statusR, statsR, rulesR, eventsR] = await Promise.all([
+      api('/api/status'), api('/api/stats'), api('/api/rules'), api('/api/events')
+    ]);
+    const status = await statusR.json();
+    const stats = await statsR.json();
+    const rules = await rulesR.json();
+    const events = await eventsR.json();
+
+    renderTopbar(status, stats);
+    renderOverview(status, stats, rules, events);
+    renderRules(rules, stats);
+    renderSessions(stats);
+    renderEvents(events);
+    renderConfig(status, rules);
+    renderSystem(status);
+  } catch(e) { /* auth redirect handled in api() */ }
+}
+
+function renderTopbar(status, stats) {
+  const dot = document.getElementById('status-dot');
+  const label = document.getElementById('status-label');
+  if (status.running) {
+    dot.className = 'status-dot ok'; label.textContent = 'Running'; label.style.color = 'var(--ok)';
+  } else {
+    dot.className = 'status-dot err'; label.textContent = 'Stopped'; label.style.color = 'var(--err)';
+  }
+  document.getElementById('chip-rules').textContent = status.rules_count;
+  const totalTcp = stats.reduce((a,s) => a + s.active_tcp_connections, 0);
+  const totalUdp = stats.reduce((a,s) => a + s.active_udp_sessions, 0);
+  document.getElementById('chip-tcp').textContent = totalTcp;
+  document.getElementById('chip-udp').textContent = totalUdp;
+  document.getElementById('chip-uptime').textContent = fmtUptime(status.uptime_secs);
+}
+
+function renderOverview(status, stats, rules, events) {
+  const totalC2S = stats.reduce((a,s) => a + s.bytes_client_to_server, 0);
+  const totalS2C = stats.reduce((a,s) => a + s.bytes_server_to_client, 0);
+  const totalTcp = stats.reduce((a,s) => a + s.active_tcp_connections, 0);
+  const totalUdp = stats.reduce((a,s) => a + s.active_udp_sessions, 0);
+  const totalDrops = stats.reduce((a,s) => a + s.dropped_packets, 0);
+  const totalFilters = stats.reduce((a,s) => a + s.filter_matches, 0);
+
+  document.getElementById('overview-cards').innerHTML = `
+    <div class="card"><div class="card-label">Status</div><div class="card-value ${status.running?'ok':'err'}">${status.running?'Running':'Stopped'}</div><div class="card-sub">uptime ${fmtUptime(status.uptime_secs)}</div></div>
+    <div class="card"><div class="card-label">Bytes In</div><div class="card-value">${fmtBytes(totalC2S)}</div></div>
+    <div class="card"><div class="card-label">Bytes Out</div><div class="card-value">${fmtBytes(totalS2C)}</div></div>
+    <div class="card"><div class="card-label">TCP Connections</div><div class="card-value">${totalTcp}</div></div>
+    <div class="card"><div class="card-label">UDP Sessions</div><div class="card-value">${totalUdp}</div></div>
+    <div class="card"><div class="card-label">Dropped</div><div class="card-value ${totalDrops>0?'warn':''}">${totalDrops}</div></div>
+    <div class="card"><div class="card-label">Filter Hits</div><div class="card-value">${totalFilters}</div></div>
+    <div class="card"><div class="card-label">Rules</div><div class="card-value">${rules.length}</div></div>
+  `;
+
+  document.getElementById('rules-count').textContent = rules.length;
+  document.getElementById('overview-rules').innerHTML = rules.map(r => `<tr>
+    <td><strong>${esc(r.name)}</strong></td>
+    <td><span class="badge badge-${r.protocol}">${r.protocol.toUpperCase()}</span></td>
+    <td class="mono">${esc(r.listen)}</td><td class="mono">${esc(r.target)}</td>
+    <td>${r.filters_count}</td><td>${r.has_duplicate?'<span class="badge badge-ok">Yes</span>':'—'}</td>
+    <td>${r.has_exporter?'<span class="badge badge-ok">Yes</span>':'—'}</td>
+  </tr>`).join('');
+
+  document.getElementById('overview-stats').innerHTML = stats.map(s => `<tr>
+    <td><strong>${esc(s.rule_name)}</strong></td>
+    <td class="mono">${fmtBytes(s.bytes_client_to_server)}</td><td class="mono">${fmtBytes(s.bytes_server_to_client)}</td>
+    <td class="mono">${s.packets_client_to_server}</td><td class="mono">${s.packets_server_to_client}</td>
+    <td class="mono">${s.active_tcp_connections}</td><td class="mono">${s.active_udp_sessions}</td>
+    <td class="mono">${s.dropped_packets}</td><td class="mono">${s.filter_matches}</td>
+    <td class="mono">${s.export_drops}</td>
+  </tr>`).join('');
+
+  document.getElementById('events-count').textContent = events.length;
+  document.getElementById('overview-events').innerHTML = events.slice(-30).reverse().map(e =>
+    `<div class="event-row"><span class="event-time">${fmtTime(e.timestamp_ms)}</span><span class="event-kind">${esc(e.kind)}</span><span class="event-detail">${esc(e.detail)}</span></div>`
+  ).join('');
+}
+
+function renderRules(rules, stats) {
+  document.getElementById('rules-count2').textContent = rules.length;
+  const statsMap = {};
+  stats.forEach(s => statsMap[s.rule_name] = s);
+
+  document.getElementById('rules-table').innerHTML = rules.map(r => {
+    const s = statsMap[r.name] || {};
+    return `<tr onclick="showRuleDetail('${esc(r.name)}');" style="cursor:pointer;">
+      <td><strong>${esc(r.name)}</strong></td>
+      <td><span class="badge badge-${r.protocol}">${r.protocol.toUpperCase()}</span></td>
+      <td class="mono">${esc(r.listen)}</td><td class="mono">${esc(r.target)}</td>
+      <td>${r.filters_count}</td><td>${r.has_duplicate?'Yes':'—'}</td><td>${r.has_exporter?'Yes':'—'}</td>
+    </tr>`;
+  }).join('');
+
+  // Cache for detail view
+  window._rules = rules;
+  window._statsMap = statsMap;
+}
+
+function showRuleDetail(name) {
+  const r = window._rules?.find(x => x.name === name);
+  const s = window._statsMap?.[name] || {};
+  if (!r) return;
+  document.getElementById('rule-detail').innerHTML = `
+    <div class="detail">
+      <h3>${esc(r.name)}</h3>
+      <div class="detail-row"><span class="detail-key">Protocol</span><span class="detail-val"><span class="badge badge-${r.protocol}">${r.protocol.toUpperCase()}</span></span></div>
+      <div class="detail-row"><span class="detail-key">Listen</span><span class="detail-val">${esc(r.listen)}</span></div>
+      <div class="detail-row"><span class="detail-key">Target</span><span class="detail-val">${esc(r.target)}</span></div>
+      <div class="detail-row"><span class="detail-key">Filters</span><span class="detail-val">${r.filters_count}</span></div>
+      <div class="detail-row"><span class="detail-key">Duplicate</span><span class="detail-val">${r.has_duplicate?'Yes':'No'}</span></div>
+      <div class="detail-row"><span class="detail-key">Exporter</span><span class="detail-val">${r.has_exporter?'Yes':'No'}</span></div>
+      <hr style="border:none;border-top:1px solid var(--bg-4);margin:12px 0;">
+      <div class="detail-row"><span class="detail-key">Bytes C→S</span><span class="detail-val">${fmtBytes(s.bytes_client_to_server||0)}</span></div>
+      <div class="detail-row"><span class="detail-key">Bytes S→C</span><span class="detail-val">${fmtBytes(s.bytes_server_to_client||0)}</span></div>
+      <div class="detail-row"><span class="detail-key">Pkts C→S</span><span class="detail-val">${s.packets_client_to_server||0}</span></div>
+      <div class="detail-row"><span class="detail-key">Pkts S→C</span><span class="detail-val">${s.packets_server_to_client||0}</span></div>
+      <div class="detail-row"><span class="detail-key">TCP Connections</span><span class="detail-val">${s.active_tcp_connections||0}</span></div>
+      <div class="detail-row"><span class="detail-key">UDP Sessions</span><span class="detail-val">${s.active_udp_sessions||0}</span></div>
+      <div class="detail-row"><span class="detail-key">Dropped</span><span class="detail-val">${s.dropped_packets||0}</span></div>
+      <div class="detail-row"><span class="detail-key">Filter Matches</span><span class="detail-val">${s.filter_matches||0}</span></div>
+      <div class="detail-row"><span class="detail-key">Export Drops</span><span class="detail-val">${s.export_drops||0}</span></div>
+    </div>`;
+}
+
+function renderSessions(stats) {
+  const totalTcp = stats.reduce((a,s) => a + s.active_tcp_connections, 0);
+  const totalUdp = stats.reduce((a,s) => a + s.active_udp_sessions, 0);
+
+  document.getElementById('session-cards').innerHTML = `
+    <div class="card"><div class="card-label">Total TCP Connections</div><div class="card-value">${totalTcp}</div></div>
+    <div class="card"><div class="card-label">Total UDP Sessions</div><div class="card-value">${totalUdp}</div></div>
+  `;
+
+  document.getElementById('sessions-table').innerHTML = stats.map(s => `<tr>
+    <td><strong>${esc(s.rule_name)}</strong></td>
+    <td class="mono">${s.active_tcp_connections}</td><td class="mono">${s.active_udp_sessions}</td>
+    <td class="mono">${fmtBytes(s.bytes_client_to_server)}</td><td class="mono">${fmtBytes(s.bytes_server_to_client)}</td>
+  </tr>`).join('');
+}
+
+function renderEvents(events) {
+  if (eventsPaused) return;
+  allEvents = events;
+  document.getElementById('events-stream').innerHTML = events.slice().reverse().map(e =>
+    `<div class="event-row"><span class="event-time">${fmtTime(e.timestamp_ms)}</span><span class="event-kind">${esc(e.kind)}</span><span class="event-detail">${esc(e.detail)}</span></div>`
+  ).join('');
+}
+
+function toggleEventsPause() {
+  eventsPaused = !eventsPaused;
+  document.getElementById('events-pause-btn').textContent = eventsPaused ? 'Resume' : 'Pause';
+}
+function clearEvents() {
+  allEvents = [];
+  document.getElementById('events-stream').innerHTML = '<div class="empty"><div class="empty-text">Events cleared</div></div>';
+}
+
+function renderConfig(status, rules) {
+  document.getElementById('cfg-path').textContent = status.config_path;
+  document.getElementById('config-rules').innerHTML = rules.map(r => `<tr>
+    <td><strong>${esc(r.name)}</strong></td>
+    <td><span class="badge badge-${r.protocol}">${r.protocol.toUpperCase()}</span></td>
+    <td class="mono">${esc(r.listen)}</td><td class="mono">${esc(r.target)}</td>
+    <td>${r.filters_count}</td>
+  </tr>`).join('');
+}
+
+function renderSystem(status) {
+  document.getElementById('system-cards').innerHTML = `
+    <div class="card"><div class="card-label">Version</div><div class="card-value" style="font-size:16px;">0.1.0</div></div>
+    <div class="card"><div class="card-label">Uptime</div><div class="card-value" style="font-size:16px;">${fmtUptime(status.uptime_secs)}</div></div>
+    <div class="card"><div class="card-label">Config</div><div class="card-value" style="font-size:13px;word-break:break-all;">${esc(status.config_path)}</div></div>
+    <div class="card"><div class="card-label">Rules Active</div><div class="card-value">${status.rules_count}</div></div>
+  `;
+  document.getElementById('system-features').innerHTML = ['web'].map(f =>
+    `<span class="badge badge-ok">${f}</span>`
+  ).join('');
+}
+
+// ACTIONS
+async function doReload() {
+  try { await api('/api/reload', {method:'POST'}); toast('Config reloaded'); refreshAll(); }
+  catch(e) { toast('Reload failed', 'err'); }
+}
+async function doStop() {
+  if (!confirm('Shutdown Harpoon daemon?')) return;
+  try { await api('/api/stop', {method:'POST'}); toast('Shutdown initiated'); }
+  catch(e) { toast('Shutdown failed', 'err'); }
+}
+
+// UTILS
+function fmtBytes(n) {
+  if (n===undefined) return '0 B';
+  if (n < 1024) return n + ' B';
+  if (n < 1048576) return (n/1024).toFixed(1) + ' KB';
+  if (n < 1073741824) return (n/1048576).toFixed(1) + ' MB';
+  return (n/1073741824).toFixed(2) + ' GB';
+}
+function fmtUptime(s) {
+  if (s < 60) return s + 's';
+  if (s < 3600) return Math.floor(s/60) + 'm ' + (s%60) + 's';
+  return Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
+}
+function fmtTime(ms) {
+  if (!ms) return '—';
+  return new Date(ms).toLocaleTimeString('en-GB', {hour12:false, hour:'2-digit', minute:'2-digit', second:'2-digit'}) + '.' + String(ms%1000).padStart(3,'0');
+}
+function esc(s) { if(!s) return ''; const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
+
+// INIT
+(async () => {
+  if (token) {
+    try { const r = await api('/api/status'); if (r.ok) { showApp(); refreshAll(); return; } } catch(e) {}
+  }
+  showLogin();
+})();
+
+setInterval(() => { if (token && document.getElementById('app').style.display === 'grid') refreshAll(); }, 3000);
+</script>
+</body>
+</html>
