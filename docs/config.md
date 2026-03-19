@@ -12,6 +12,33 @@ shutdown_timeout_secs = 5       # Graceful shutdown deadline
 web_bind = "127.0.0.1:8888"    # Web UI bind address (requires --features web)
 ```
 
+## Web UI
+
+Requires building with `--features web`.
+
+```toml
+[global]
+web_bind = "127.0.0.1:8888"
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `web_bind` | `string` | Address and port for the web server. Omit to disable. |
+
+When set, Harpoon starts an HTTP server alongside the engine. Open `http://<web_bind>/` in a browser to see the dashboard.
+
+API endpoints:
+
+| Endpoint | Description |
+|---|---|
+| `GET /` | HTML dashboard (auto-refreshes every 3s) |
+| `GET /api/status` | JSON: running, uptime, rules count, config path |
+| `GET /api/stats` | JSON array: per-rule bytes, packets, connections, sessions, drops |
+| `GET /api/rules` | JSON array: rule name, protocol, listen, target, filter count |
+| `GET /api/events` | JSON array: last 100 events with timestamp, kind, detail |
+
+The web server binds only when the `web` feature is compiled in **and** `web_bind` is present in the config. If the feature is not compiled in, the field is silently ignored.
+
 ## Rules
 
 Each rule defines a proxy endpoint.

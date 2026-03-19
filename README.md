@@ -85,6 +85,49 @@ target = "8.8.8.8:53"
 idle_timeout_secs = 30
 ```
 
+## Web UI
+
+Harpoon includes a built-in web dashboard. It requires the `web` feature at build time.
+
+**1. Build with the `web` feature:**
+
+```bash
+cargo build --release --features web
+```
+
+**2. Add `web_bind` to your config:**
+
+```toml
+[global]
+web_bind = "127.0.0.1:8888"
+```
+
+**3. Start harpoon:**
+
+```bash
+./target/release/harpoon run -c config.toml
+```
+
+**4. Open in browser:**
+
+```
+http://127.0.0.1:8888
+```
+
+The dashboard auto-refreshes every 3 seconds and shows:
+- Status (uptime, rule count, config path)
+- Active rules (protocol, listen/target addresses, filter count)
+- Live stats (bytes, packets, connections, sessions, drops)
+- Recent events (timestamps, event types, details)
+
+REST API endpoints are also available:
+- `GET /api/status` — daemon status
+- `GET /api/stats` — per-rule traffic stats
+- `GET /api/rules` — active rule list
+- `GET /api/events` — recent events (last 100)
+
+By default `web_bind` should point to `127.0.0.1` for security. To expose externally, use `0.0.0.0:8888` (not recommended without additional access control).
+
 ## Optional Features
 
 Build with features for additional capabilities:
@@ -108,10 +151,10 @@ cargo build --release --features "tls,regex-filter,web,transparent-udp"
 
 ## Documentation
 
-- [Configuration Reference](docs/config.md)
-- [Architecture Overview](docs/architecture.md)
-- [nftables Integration](docs/nftables.md)
-- [Example Config](docs/example-config.toml)
+- [Configuration Reference](docs/config.md) — all TOML settings, filters, TLS, nftables, web UI
+- [Architecture Overview](docs/architecture.md) — crate structure, design decisions, feature flags
+- [nftables Integration](docs/nftables.md) — REDIRECT, DNAT, TPROXY setup
+- [Example Config](docs/example-config.toml) — annotated config with all options
 
 ## Testing
 
