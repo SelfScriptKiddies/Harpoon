@@ -6,22 +6,27 @@ use anyhow::{bail, Context, Result};
 use harpoon_core::config::CoreConfig;
 use harpoon_core::types::endpoint::{Endpoint, Protocol};
 use harpoon_core::types::filter::{Direction, Filter, FilterAction, FilterKind};
+use harpoon_core::types::pipeline as pipe;
 use harpoon_core::types::rule::{
     DuplicateTarget, ExporterConfig, ExporterKind, Rule, TlsConfig, TlsMode, UdpSourceMode,
 };
 
-use crate::config::schema::{AppConfig, AppRule};
+use crate::config::schema::{AppConfig, AppPipeline, AppRule};
 
 pub fn convert(app: AppConfig) -> Result<CoreConfig> {
     let mut rules = Vec::new();
-
     for r in app.rules {
-        let rule = convert_rule(r)?;
-        rules.push(rule);
+        rules.push(convert_rule(r)?);
+    }
+
+    let mut pipelines = Vec::new();
+    for p in app.pipelines {
+        pipelines.push(convert_pipeline(p)?);
     }
 
     let mut config = CoreConfig {
         rules,
+        pipelines,
         ..CoreConfig::default()
     };
 
@@ -146,6 +151,163 @@ fn convert_rule(r: AppRule) -> Result<Rule> {
     })
 }
 
+pub fn convert_pipeline_public(p: AppPipeline) -> Result<pipe::Pipeline> {
+    convert_pipeline(p)
+}
+
+fn convert_pipeline(p: AppPipeline) -> Result<pipe::Pipeline> {
+    let mut nodes = Vec::new();
+    for n in &p.nodes {
+        let kind = convert_pipeline_node(n)
+            .with_context(|| format!("node {} in pipeline '{}'", n.id, p.name))?;
+        nodes.push(pipe::Node {
+            id: n.id,
+            label: n.label.clone().unwrap_or_else(|| n.kind.clone()),
+            kind,
+        });
+    }
+
+    let edges = p
+        .edges
+        .iter()
+        .enumerate()
+        .map(|(i, e)| pipe::Edge {
+            id: i as u32 + 1,
+            from_node: e.from,
+            to_node: e.to,
+            from_port: e.port.clone(),
+        })
+        .collect();
+
+    Ok(pipe::Pipeline {
+        id: p.id,
+        name: p.name,
+        nodes,
+        edges,
+    })
+}
+
+fn convert_pipeline_node(n: &crate::config::schema::AppPipelineNode) -> Result<pipe::NodeKind> {
+    let c = &n.config;
+    match n.kind.as_str() {
+        "source" => {
+            let proto = match c.get("protocol").and_then(|v| v.as_str()).unwrap_or("tcp") {
+                "tcp" => Protocol::Tcp,
+                "udp" => Protocol::Udp,
+                other => bail!("unknown protocol: {other}"),
+            };
+            let listen: SocketAddr = c.get("listen").and_then(|v| v.as_str()).unwrap_or("0.0.0.0:0")
+                .parse().context("invalid listen address")?;
+            let udp_mode = match c.get("udp_source_mode").and_then(|v| v.as_str()) {
+                Some("preserve") => UdpSourceMode::Preserve,
+                _ => UdpSourceMode::Proxy,
+            };
+            let timeout = c.get("idle_timeout_secs").and_then(|v| v.as_u64()).unwrap_or(30);
+            Ok(pipe::NodeKind::Source(pipe::SourceConfig {
+                endpoint: Endpoint { addr: listen, protocol: proto },
+                udp_source_mode: udp_mode,
+                idle_timeout_secs: timeout,
+            }))
+        }
+        "forward" => {
+            let target: SocketAddr = c.get("target").and_then(|v| v.as_str()).unwrap_or("0.0.0.0:0")
+                .parse().context("invalid target address")?;
+            let proto = c.get("protocol").and_then(|v| v.as_str()).map(|p| match p {
+                "udp" => Protocol::Udp, _ => Protocol::Tcp,
+            }).unwrap_or(Protocol::Tcp);
+            let nodelay = c.get("tcp_nodelay").and_then(|v| v.as_bool()).unwrap_or(true);
+            Ok(pipe::NodeKind::Forward(pipe::ForwardConfig {
+                endpoint: Endpoint { addr: target, protocol: proto },
+                tcp_nodelay: nodelay,
+            }))
+        }
+        "tls_terminate" => {
+            let cert = c.get("ca_cert").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let key = c.get("ca_key").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            Ok(pipe::NodeKind::TlsTerminate(pipe::TlsTerminateConfig {
+                ca_cert_path: PathBuf::from(cert),
+                ca_key_path: PathBuf::from(key),
+            }))
+        }
+        "tls_initiate" => {
+            let verify = c.get("verify_certs").and_then(|v| v.as_bool()).unwrap_or(true);
+            Ok(pipe::NodeKind::TlsInitiate(pipe::TlsInitiateConfig { verify_certs: verify }))
+        }
+        "filter" => {
+            let kind_str = c.get("kind").and_then(|v| v.as_str()).unwrap_or("substr");
+            let pattern = c.get("pattern").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let dir = match c.get("direction").and_then(|v| v.as_str()) {
+                Some("c2s") => Direction::ClientToServer,
+                Some("s2c") => Direction::ServerToClient,
+                _ => Direction::Both,
+            };
+            let action = match c.get("action").and_then(|v| v.as_str()) {
+                Some("pass") => FilterAction::Pass,
+                Some("tap-only") | Some("tap_only") => FilterAction::TapOnly,
+                _ => FilterAction::Drop,
+            };
+            let filter_kind = match kind_str {
+                "substr" => FilterKind::Substr(pattern),
+                "bsubstr" => {
+                    let bytes = hex_decode(&pattern).context("invalid hex in bsubstr")?;
+                    FilterKind::BinarySubstr(bytes)
+                }
+                #[cfg(feature = "regex-filter")]
+                "regex" => FilterKind::Regex(pattern),
+                #[cfg(not(feature = "regex-filter"))]
+                "regex" => bail!("regex feature not enabled"),
+                other => bail!("unknown filter kind: {other}"),
+            };
+            Ok(pipe::NodeKind::Filter(pipe::FilterNodeConfig {
+                filters: vec![Filter { kind: filter_kind, direction: dir, action_on_match: action }],
+            }))
+        }
+        "duplicate" => {
+            let target: SocketAddr = c.get("target").and_then(|v| v.as_str()).unwrap_or("0.0.0.0:0")
+                .parse().context("invalid duplicate target")?;
+            Ok(pipe::NodeKind::Duplicate(pipe::DuplicateConfig {
+                endpoint: Endpoint::tcp(target),
+            }))
+        }
+        "export" => {
+            let exp_kind = c.get("kind").and_then(|v| v.as_str()).unwrap_or("tcp");
+            let ek = match exp_kind {
+                "uds" | "unix" => {
+                    let path = c.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    ExporterKind::Uds { path: PathBuf::from(path) }
+                }
+                _ => {
+                    let addr: SocketAddr = c.get("addr").and_then(|v| v.as_str()).unwrap_or("127.0.0.1:4000")
+                        .parse().context("invalid exporter addr")?;
+                    ExporterKind::TcpFramed { addr }
+                }
+            };
+            Ok(pipe::NodeKind::Export(pipe::ExportNodeConfig {
+                exporter: ExporterConfig { kind: ek },
+            }))
+        }
+        "drop" => Ok(pipe::NodeKind::Drop),
+        "router" => {
+            let kind_str = c.get("kind").and_then(|v| v.as_str()).unwrap_or("substr");
+            let pattern = c.get("pattern").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let dir = match c.get("direction").and_then(|v| v.as_str()) {
+                Some("c2s") => Direction::ClientToServer,
+                Some("s2c") => Direction::ServerToClient,
+                _ => Direction::Both,
+            };
+            let fk = match kind_str {
+                "substr" => FilterKind::Substr(pattern),
+                "bsubstr" => FilterKind::BinarySubstr(hex_decode(&pattern)?),
+                _ => FilterKind::Substr(pattern),
+            };
+            Ok(pipe::NodeKind::Router(pipe::RouterConfig {
+                filter: Filter { kind: fk, direction: dir, action_on_match: FilterAction::Drop },
+            }))
+        }
+        other => bail!("unknown pipeline node kind: {other}"),
+    }
+}
+
 fn convert_filter(
     f: crate::config::schema::AppFilter,
     rule_name: &str,
@@ -211,6 +373,7 @@ mod tests {
     fn test_convert_basic_tcp_rule() {
         let app = AppConfig {
             global: GlobalConfig::default(),
+            pipelines: vec![],
             rules: vec![AppRule {
                 name: "test".into(),
                 protocol: "tcp".into(),
@@ -235,6 +398,7 @@ mod tests {
     fn test_convert_with_filter() {
         let app = AppConfig {
             global: GlobalConfig::default(),
+            pipelines: vec![],
             rules: vec![AppRule {
                 name: "filtered".into(),
                 protocol: "udp".into(),

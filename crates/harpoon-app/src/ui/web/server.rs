@@ -45,6 +45,11 @@ pub async fn run_web_server(
         .route("/api/rules/create", post(api_rule_create))
         .route("/api/rules/update", post(api_rule_update))
         .route("/api/rules/delete", post(api_rule_delete))
+        .route("/api/pipelines", get(api_pipelines))
+        .route("/api/pipelines/create", post(api_pipeline_create))
+        .route("/api/pipelines/update", post(api_pipeline_update))
+        .route("/api/pipelines/delete", post(api_pipeline_delete))
+        .route("/api/pipelines/validate", post(api_pipeline_validate))
         .route("/api/events", get(api_events))
         .route("/api/config/toml", get(api_config_toml))
         .route("/api/nft/status", get(api_nft_status))
@@ -448,6 +453,133 @@ where
     if let Err(e) =
         crate::daemon::run::apply_app_config(&state.control, app_config, &config_path).await
     {
+        return Ok(Json(serde_json::json!({"ok": false, "error": format!("apply: {e}")})));
+    }
+
+    Ok(Json(serde_json::json!({"ok": true})))
+}
+
+// --- Pipeline CRUD ---
+
+async fn api_pipelines(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<crate::config::schema::AppPipeline>>, StatusCode> {
+    require_auth!(state, headers);
+    let s = state.control.read().await;
+    match &s.app_config {
+        Some(cfg) => Ok(Json(cfg.pipelines.clone())),
+        None => Ok(Json(vec![])),
+    }
+}
+
+async fn api_pipeline_create(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+    Json(new_pipeline): Json<crate::config::schema::AppPipeline>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_auth!(state, headers);
+    modify_config(&state, |cfg| {
+        if cfg.pipelines.iter().any(|p| p.id == new_pipeline.id) {
+            return Err(format!("pipeline '{}' already exists", new_pipeline.id));
+        }
+        cfg.pipelines.push(new_pipeline);
+        Ok(())
+    })
+    .await
+}
+
+#[derive(serde::Deserialize)]
+struct PipelineUpdateReq {
+    id: String,
+    pipeline: crate::config::schema::AppPipeline,
+}
+
+async fn api_pipeline_update(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+    Json(req): Json<PipelineUpdateReq>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_auth!(state, headers);
+    modify_config(&state, |cfg| {
+        let idx = cfg.pipelines.iter().position(|p| p.id == req.id)
+            .ok_or_else(|| format!("pipeline '{}' not found", req.id))?;
+        cfg.pipelines[idx] = req.pipeline;
+        Ok(())
+    })
+    .await
+}
+
+#[derive(serde::Deserialize)]
+struct PipelineDeleteReq {
+    id: String,
+}
+
+async fn api_pipeline_delete(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+    Json(req): Json<PipelineDeleteReq>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_auth!(state, headers);
+    modify_config(&state, |cfg| {
+        let idx = cfg.pipelines.iter().position(|p| p.id == req.id)
+            .ok_or_else(|| format!("pipeline '{}' not found", req.id))?;
+        cfg.pipelines.remove(idx);
+        Ok(())
+    })
+    .await
+}
+
+async fn api_pipeline_validate(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+    Json(pipeline): Json<crate::config::schema::AppPipeline>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_auth!(state, headers);
+    match crate::convert::convert_pipeline_public(pipeline) {
+        Ok(core_pipeline) => {
+            match harpoon_core::pipeline::compile::compile(core_pipeline) {
+                Ok(plan) => Ok(Json(serde_json::json!({
+                    "valid": true, "tier": plan.tier(), "errors": [], "warnings": [],
+                }))),
+                Err(e) => Ok(Json(serde_json::json!({
+                    "valid": false, "errors": [format!("{e}")],
+                }))),
+            }
+        }
+        Err(e) => Ok(Json(serde_json::json!({
+            "valid": false, "errors": [format!("{e}")],
+        }))),
+    }
+}
+
+/// Generic config modifier: mutate AppConfig → validate → save → apply.
+async fn modify_config<F>(
+    state: &Arc<WebState>,
+    f: F,
+) -> Result<Json<serde_json::Value>, StatusCode>
+where
+    F: FnOnce(&mut crate::config::schema::AppConfig) -> Result<(), String>,
+{
+    let (mut app_config, config_path) = {
+        let s = state.control.read().await;
+        let cfg = s.app_config.clone().ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+        (cfg, s.config_path.clone())
+    };
+
+    if let Err(msg) = f(&mut app_config) {
+        return Ok(Json(serde_json::json!({"ok": false, "error": msg})));
+    }
+
+    if let Err(e) = crate::convert::convert(app_config.clone()) {
+        return Ok(Json(serde_json::json!({"ok": false, "error": format!("validation: {e}")})));
+    }
+
+    if let Err(e) = crate::config::load::save_config(&config_path, &app_config) {
+        return Ok(Json(serde_json::json!({"ok": false, "error": format!("save: {e}")})));
+    }
+
+    if let Err(e) = crate::daemon::run::apply_app_config(&state.control, app_config, &config_path).await {
         return Ok(Json(serde_json::json!({"ok": false, "error": format!("apply: {e}")})));
     }
 

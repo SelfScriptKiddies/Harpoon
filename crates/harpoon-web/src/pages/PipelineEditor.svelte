@@ -1,6 +1,6 @@
 <script>
   import { NODE_KINDS, CATEGORIES, PRESETS } from '../lib/types.js';
-  import { createRule, updateRule, validatePipeline } from '../lib/api.js';
+  import { createRule, updateRule, validatePipeline, createPipeline } from '../lib/api.js';
   import NodeBlock from '../components/NodeBlock.svelte';
 
   let { preset = null, onSave, onCancel } = $props();
@@ -224,17 +224,40 @@
 
   async function handleSave() {
     error = '';
-    const rule = pipelineToRule();
-    if (!rule) { error = 'Pipeline must have a Source and Forward node'; return; }
     if (!pipelineName) { error = 'Pipeline name is required'; return; }
-    if (!rule.listen || !rule.target) { error = 'Listen and target addresses required'; return; }
+
+    // Try saving as a pipeline first
+    const payload = buildPipelinePayload();
+    const appPipeline = {
+      id: pipelineName.toLowerCase().replace(/\s+/g, '-'),
+      name: pipelineName,
+      nodes: payload.nodes.map(n => ({
+        id: n.id,
+        kind: n.kind,
+        label: n.label,
+        config: n.config || {},
+      })),
+      edges: payload.edges,
+    };
 
     try {
-      const result = await createRule(rule);
+      // Try pipeline API
+      const result = await createPipeline(appPipeline);
       if (result.ok) {
         onSave?.();
+        return;
+      }
+      // If pipeline API fails, fall back to rule conversion
+      const rule = pipelineToRule();
+      if (rule && rule.listen && rule.target) {
+        const ruleResult = await createRule(rule);
+        if (ruleResult.ok) {
+          onSave?.();
+          return;
+        }
+        error = ruleResult.error || result.error || 'Save failed';
       } else {
-        error = result.error || 'Save failed';
+        error = result.error || 'Pipeline must have valid Source and Forward nodes';
       }
     } catch (e) {
       error = 'Save failed: ' + e.message;

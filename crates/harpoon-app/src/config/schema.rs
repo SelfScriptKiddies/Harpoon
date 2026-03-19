@@ -6,6 +6,35 @@ pub struct AppConfig {
     pub global: GlobalConfig,
     #[serde(default)]
     pub rules: Vec<AppRule>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pipelines: Vec<AppPipeline>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppPipeline {
+    pub id: String,
+    pub name: String,
+    pub nodes: Vec<AppPipelineNode>,
+    #[serde(default)]
+    pub edges: Vec<AppPipelineEdge>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppPipelineNode {
+    pub id: u32,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub config: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppPipelineEdge {
+    pub from: u32,
+    pub to: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
