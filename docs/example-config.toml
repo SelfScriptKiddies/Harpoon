@@ -2,6 +2,7 @@
 buffer_size = 8192
 udp_max_datagram = 65507
 shutdown_timeout_secs = 5
+# web_bind = "127.0.0.1:8888"  # web UI (requires --features web)
 
 [[rules]]
 name = "web-proxy"
@@ -59,3 +60,15 @@ addr = "127.0.0.1:4000"
 # action = "tproxy"
 # to_port = 8443
 # comment = "transparent HTTPS intercept"
+
+# --- TLS MITM (optional, requires --features tls) ---
+# [[rules]]
+# name = "https-mitm"
+# protocol = "tcp"
+# listen = "0.0.0.0:8443"
+# target = "10.0.0.1:443"
+#
+# [rules.tls]
+# mode = "mitm"        # passthrough | terminate | mitm
+# ca_cert = "/etc/harpoon/ca.pem"
+# ca_key = "/etc/harpoon/ca-key.pem"

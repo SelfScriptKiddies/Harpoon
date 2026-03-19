@@ -10,8 +10,11 @@ use crate::engine::filter::{apply_filters, CompiledFilter};
 use crate::error::HarpoonError;
 use crate::types::event::{Event, EventKind};
 use crate::types::filter::{Direction, FilterAction};
-use crate::types::rule::Rule;
+use crate::types::rule::{Rule, TlsMode};
 use crate::types::stats::RuleStats;
+
+#[cfg(feature = "tls")]
+use crate::tls::cert::CertAuthority;
 
 pub async fn run_tcp_rule(
     rule: Rule,
@@ -21,6 +24,7 @@ pub async fn run_tcp_rule(
     export_tx: Option<mpsc::Sender<Event>>,
     cancel: CancellationToken,
     buffer_size: usize,
+    #[cfg(feature = "tls")] ca: Option<Arc<CertAuthority>>,
 ) -> Result<(), HarpoonError> {
     let listener = TcpListener::bind(rule.listen.addr)
         .await
@@ -42,6 +46,12 @@ pub async fn run_tcp_rule(
     let target_addr = rule.target.addr;
     let rule_name = Arc::new(rule.name.clone());
     let dup_endpoint = rule.duplicate.as_ref().map(|d| d.endpoint.addr);
+
+    // Determine TLS mode
+    #[cfg(feature = "tls")]
+    let tls_mode = rule.tls.as_ref().map(|t| t.mode.clone());
+    #[cfg(not(feature = "tls"))]
+    let _tls_mode: Option<TlsMode> = None;
 
     loop {
         tokio::select! {
@@ -67,20 +77,50 @@ pub async fn run_tcp_rule(
                 let cancel = cancel.child_token();
                 let rule_name = rule_name.clone();
 
+                #[cfg(feature = "tls")]
+                let ca = ca.clone();
+                #[cfg(feature = "tls")]
+                let tls_mode = tls_mode.clone();
+
                 tokio::spawn(async move {
-                    if let Err(e) = handle_tcp_connection(
-                        client_stream,
-                        client_addr,
-                        target_addr,
-                        dup_endpoint,
-                        &filters,
-                        &stats,
-                        &event_tx,
-                        &export_tx,
-                        &cancel,
-                        buffer_size,
-                        &rule_name,
-                    ).await {
+                    let result = {
+                        #[cfg(feature = "tls")]
+                        {
+                            match &tls_mode {
+                                Some(mode) if !matches!(mode, TlsMode::Passthrough) => {
+                                    if let Some(ref ca) = ca {
+                                        crate::tls::mitm::handle_tls_connection(
+                                            client_stream, client_addr, target_addr,
+                                            mode, ca, &filters, &stats,
+                                            &event_tx, &export_tx, &cancel,
+                                            buffer_size, &rule_name,
+                                        ).await
+                                    } else {
+                                        Err(HarpoonError::Config("TLS mode requires CA certificate".into()))
+                                    }
+                                }
+                                _ => {
+                                    handle_tcp_connection(
+                                        client_stream, client_addr, target_addr,
+                                        dup_endpoint, &filters, &stats,
+                                        &event_tx, &export_tx, &cancel,
+                                        buffer_size, &rule_name,
+                                    ).await
+                                }
+                            }
+                        }
+                        #[cfg(not(feature = "tls"))]
+                        {
+                            handle_tcp_connection(
+                                client_stream, client_addr, target_addr,
+                                dup_endpoint, &filters, &stats,
+                                &event_tx, &export_tx, &cancel,
+                                buffer_size, &rule_name,
+                            ).await
+                        }
+                    };
+
+                    if let Err(e) = result {
                         tracing::debug!(rule = %rule_name, error = %e, "tcp connection ended");
                     }
 

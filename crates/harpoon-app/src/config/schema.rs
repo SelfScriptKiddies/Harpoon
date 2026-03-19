@@ -13,6 +13,8 @@ pub struct GlobalConfig {
     pub buffer_size: Option<usize>,
     pub udp_max_datagram: Option<usize>,
     pub shutdown_timeout_secs: Option<u64>,
+    #[allow(dead_code)]
+    pub web_bind: Option<String>,
     #[serde(default)]
     pub nft: NftConfig,
 }
@@ -47,7 +49,15 @@ pub struct AppRule {
     pub filters: Vec<AppFilter>,
     pub duplicate: Option<String>,
     pub exporter: Option<AppExporter>,
+    pub tls: Option<AppTls>,
     pub idle_timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AppTls {
+    pub mode: String,
+    pub ca_cert: String,
+    pub ca_key: String,
 }
 
 #[derive(Debug, Deserialize)]

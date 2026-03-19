@@ -21,6 +21,23 @@ pub struct ExporterConfig {
 }
 
 #[derive(Debug, Clone)]
+pub enum TlsMode {
+    /// No TLS processing — forward raw bytes
+    Passthrough,
+    /// Terminate TLS from client, connect to upstream in plaintext
+    Terminate,
+    /// Full MITM: terminate client TLS, re-encrypt to upstream
+    Mitm,
+}
+
+#[derive(Debug, Clone)]
+pub struct TlsConfig {
+    pub mode: TlsMode,
+    pub ca_cert_path: PathBuf,
+    pub ca_key_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
 pub struct Rule {
     pub name: String,
     pub listen: Endpoint,
@@ -28,6 +45,7 @@ pub struct Rule {
     pub filters: Vec<Filter>,
     pub duplicate: Option<DuplicateTarget>,
     pub exporter: Option<ExporterConfig>,
+    pub tls: Option<TlsConfig>,
     pub idle_timeout_secs: u64,
 }
 

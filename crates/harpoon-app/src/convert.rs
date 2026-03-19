@@ -6,7 +6,7 @@ use anyhow::{bail, Context, Result};
 use harpoon_core::config::CoreConfig;
 use harpoon_core::types::endpoint::{Endpoint, Protocol};
 use harpoon_core::types::filter::{Direction, Filter, FilterAction, FilterKind};
-use harpoon_core::types::rule::{DuplicateTarget, ExporterConfig, ExporterKind, Rule};
+use harpoon_core::types::rule::{DuplicateTarget, ExporterConfig, ExporterKind, Rule, TlsConfig, TlsMode};
 
 use crate::config::schema::{AppConfig, AppRule};
 
@@ -100,6 +100,23 @@ fn convert_rule(r: AppRule) -> Result<Rule> {
         None => None,
     };
 
+    let tls = match r.tls {
+        Some(ref tls_cfg) => {
+            let mode = match tls_cfg.mode.to_lowercase().as_str() {
+                "passthrough" => TlsMode::Passthrough,
+                "terminate" => TlsMode::Terminate,
+                "mitm" => TlsMode::Mitm,
+                other => bail!("unknown TLS mode '{}' in rule '{}'", other, r.name),
+            };
+            Some(TlsConfig {
+                mode,
+                ca_cert_path: PathBuf::from(&tls_cfg.ca_cert),
+                ca_key_path: PathBuf::from(&tls_cfg.ca_key),
+            })
+        }
+        None => None,
+    };
+
     let idle_timeout_secs = r.idle_timeout_secs.unwrap_or(Rule::default_idle_timeout());
 
     Ok(Rule {
@@ -115,6 +132,7 @@ fn convert_rule(r: AppRule) -> Result<Rule> {
         filters,
         duplicate,
         exporter,
+        tls,
         idle_timeout_secs,
     })
 }
@@ -192,6 +210,7 @@ mod tests {
                 filters: vec![],
                 duplicate: None,
                 exporter: None,
+                tls: None,
                 idle_timeout_secs: None,
             }],
         };
@@ -219,6 +238,7 @@ mod tests {
                 }],
                 duplicate: None,
                 exporter: None,
+                tls: None,
                 idle_timeout_secs: Some(60),
             }],
         };

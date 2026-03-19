@@ -45,6 +45,10 @@ async fn run_engine_loop(config_path: PathBuf, socket_path: &std::path::Path) ->
     // Apply nftables rules if configured
     let (nft_active, tproxy_mark) = apply_nft_config(&app_config)?;
 
+    // Save web bind before consuming app_config
+    #[cfg(feature = "web")]
+    let _web_bind = app_config.global.web_bind.clone();
+
     let core_config = convert(app_config).context("converting config")?;
     let rules_info = build_rules_info(&core_config);
 
@@ -76,6 +80,20 @@ async fn run_engine_loop(config_path: PathBuf, socket_path: &std::path::Path) ->
             tracing::error!(error = %e, "control server error");
         }
     });
+
+    // Spawn web UI if configured
+    #[cfg(feature = "web")]
+    if let Some(ref web_bind) = _web_bind {
+        let web_addr: std::net::SocketAddr = web_bind.parse()
+            .with_context(|| format!("invalid web_bind address: {web_bind}"))?;
+        let web_state = control_state.clone();
+        let web_cancel = cancel.child_token();
+        tokio::spawn(async move {
+            if let Err(e) = crate::ui::web::server::run_web_server(web_addr, web_state, web_cancel).await {
+                tracing::error!(error = %e, "web server error");
+            }
+        });
+    }
 
     tracing::info!("harpoon is running");
 

@@ -45,6 +45,7 @@ async fn test_tcp_proxy_basic() {
             filters: vec![],
             duplicate: None,
             exporter: None,
+            tls: None,
             idle_timeout_secs: 30,
         }],
         ..CoreConfig::default()
@@ -104,6 +105,7 @@ async fn test_tcp_proxy_with_drop_filter() {
             }],
             duplicate: None,
             exporter: None,
+            tls: None,
             idle_timeout_secs: 30,
         }],
         ..CoreConfig::default()
@@ -164,6 +166,7 @@ async fn test_udp_relay_basic() {
             filters: vec![],
             duplicate: None,
             exporter: None,
+            tls: None,
             idle_timeout_secs: 30,
         }],
         ..CoreConfig::default()
@@ -217,6 +220,7 @@ async fn test_udp_session_multiple_clients() {
             filters: vec![],
             duplicate: None,
             exporter: None,
+            tls: None,
             idle_timeout_secs: 30,
         }],
         ..CoreConfig::default()
@@ -287,6 +291,7 @@ async fn test_tcp_proxy_stats() {
             filters: vec![],
             duplicate: None,
             exporter: None,
+            tls: None,
             idle_timeout_secs: 30,
         }],
         ..CoreConfig::default()

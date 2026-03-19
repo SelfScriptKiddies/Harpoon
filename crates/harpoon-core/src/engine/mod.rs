@@ -15,6 +15,9 @@ use crate::types::endpoint::Protocol;
 use crate::types::event::Event;
 use crate::types::stats::{RuleStats, RuleStatsSnapshot};
 
+#[cfg(feature = "tls")]
+use crate::tls::cert::CertAuthority;
+
 use self::filter::CompiledFilter;
 
 pub struct EngineHandle {
@@ -64,6 +67,10 @@ pub async fn run(config: CoreConfig) -> Result<EngineHandle, HarpoonError> {
     let mut handles: Vec<JoinHandle<Result<(), HarpoonError>>> = Vec::new();
     let mut stats_vec = Vec::new();
 
+    // Build CA for TLS rules if any need it
+    #[cfg(feature = "tls")]
+    let ca: Option<Arc<CertAuthority>> = build_ca(&config)?;
+
     for rule in config.rules {
         let rule_stats = Arc::new(RuleStats::default());
         stats_vec.push((rule.name.clone(), rule_stats.clone()));
@@ -88,6 +95,9 @@ pub async fn run(config: CoreConfig) -> Result<EngineHandle, HarpoonError> {
 
         match rule.listen.protocol {
             Protocol::Tcp => {
+                #[cfg(feature = "tls")]
+                let ca = ca.clone();
+
                 let h = tokio::spawn(tcp::run_tcp_rule(
                     rule,
                     rule_stats,
@@ -96,6 +106,8 @@ pub async fn run(config: CoreConfig) -> Result<EngineHandle, HarpoonError> {
                     export_tx,
                     cancel.child_token(),
                     config.buffer_size,
+                    #[cfg(feature = "tls")]
+                    ca,
                 ));
                 handles.push(h);
             }
@@ -120,4 +132,26 @@ pub async fn run(config: CoreConfig) -> Result<EngineHandle, HarpoonError> {
         stats: stats_vec,
         join_handles: handles,
     })
+}
+
+#[cfg(feature = "tls")]
+fn build_ca(config: &CoreConfig) -> Result<Option<Arc<CertAuthority>>, HarpoonError> {
+    use crate::types::rule::TlsMode;
+
+    // Find the first rule that needs TLS
+    let tls_rule = config.rules.iter().find(|r| {
+        r.tls
+            .as_ref()
+            .map(|t| !matches!(t.mode, TlsMode::Passthrough))
+            .unwrap_or(false)
+    });
+
+    match tls_rule {
+        Some(rule) => {
+            let tls_cfg = rule.tls.as_ref().unwrap();
+            let ca = CertAuthority::from_pem_files(&tls_cfg.ca_cert_path, &tls_cfg.ca_key_path)?;
+            Ok(Some(Arc::new(ca)))
+        }
+        None => Ok(None),
+    }
 }

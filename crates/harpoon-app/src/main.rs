@@ -5,6 +5,7 @@ mod convert;
 mod daemon;
 mod nft;
 mod run;
+mod ui;
 
 use clap::Parser;
 

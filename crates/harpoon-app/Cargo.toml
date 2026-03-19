@@ -11,6 +11,8 @@ path = "src/main.rs"
 [features]
 default = []
 regex-filter = ["harpoon-core/regex-filter"]
+tls = ["harpoon-core/tls"]
+web = ["axum", "tower-http"]
 
 [dependencies]
 harpoon-core = { path = "../harpoon-core" }
@@ -24,3 +26,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 anyhow = "1"
 libc = "0.2"
+axum = { version = "0.8", optional = true }
+tower-http = { version = "0.6", features = ["cors"], optional = true }

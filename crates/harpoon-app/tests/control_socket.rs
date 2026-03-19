@@ -41,6 +41,7 @@ async fn test_control_socket_full_workflow() {
             filters: vec![],
             duplicate: None,
             exporter: None,
+            tls: None,
             idle_timeout_secs: 30,
         }],
         ..CoreConfig::default()
