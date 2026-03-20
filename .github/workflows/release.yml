@@ -1,0 +1,83 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            name: linux-amd64
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            name: linux-arm64
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Build Web UI
+        run: |
+          cd crates/harpoon-web
+          npm ci
+          npx vite build --outDir ../harpoon-app/src/ui/web/static --emptyOutDir
+
+      - name: Build minimal
+        run: cross build --release --target ${{ matrix.target }} --no-default-features
+
+      - name: Build standard (web)
+        run: cross build --release --target ${{ matrix.target }} --features web
+
+      - name: Build full
+        run: cross build --release --target ${{ matrix.target }} --features "web,tls,regex-filter"
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/harpoon dist/harpoon-minimal
+          # Rebuild for each feature set since they produce the same binary name
+          cp target/${{ matrix.target }}/release/harpoon dist/harpoon-full
+          cp docs/example-config.toml dist/config.toml.example
+          cp README.md dist/
+          cd dist
+          tar czf harpoon-${{ matrix.name }}.tar.gz *
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: harpoon-${{ matrix.name }}
+          path: dist/harpoon-${{ matrix.name }}.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*.tar.gz
+          generate_release_notes: true
