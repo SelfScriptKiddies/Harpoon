@@ -78,6 +78,10 @@ pub fn simulate(pipeline: &Pipeline, payload: &[u8], direction: Direction) -> Si
                         dropped = true;
                         ("drop".into(), format!("Filter #{} matched, action=drop", matched_idx.unwrap_or(0)))
                     }
+                    FilterAction::DropConnection => {
+                        dropped = true;
+                        ("drop_connection".into(), format!("Filter #{} matched, action=drop_connection (kill connection)", matched_idx.unwrap_or(0)))
+                    }
                     FilterAction::TapOnly => ("tap-only".into(), format!("Filter #{} matched, tap-only", matched_idx.unwrap_or(0))),
                 };
 

@@ -238,7 +238,7 @@ async fn handle_tcp_connection(
                         let (action, filter_idx) = apply_filters(filters, data, &Direction::ClientToServer);
                         if let Some(idx) = filter_idx {
                             stats.filter_matches.fetch_add(1, Ordering::Relaxed);
-                            let kind = if action == FilterAction::Drop {
+                            let kind = if action == FilterAction::Drop || action == FilterAction::DropConnection {
                                 EventKind::FilterDrop { rule: rule_name.clone(), filter_index: idx }
                             } else {
                                 EventKind::FilterMatch { rule: rule_name.clone(), filter_index: idx }
@@ -246,10 +246,18 @@ async fn handle_tcp_connection(
                             emit_event(&event_tx, &export_tx, stats, kind).await;
                         }
 
+                        let filter_name = filter_idx.map(|i| format!("filter#{i}"));
+
                         match action {
                             FilterAction::Drop => {
                                 stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                                capture.record_with_filter(&rule_name, crate::capture::PacketDirection::ClientToServer, client_addr, target_addr, data, filter_name, true).await;
                                 continue;
+                            }
+                            FilterAction::DropConnection => {
+                                stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                                capture.record_with_filter(&rule_name, crate::capture::PacketDirection::ClientToServer, client_addr, target_addr, data, filter_name, true).await;
+                                break;
                             }
                             FilterAction::TapOnly => {
                                 emit_event(&event_tx, &export_tx, stats, EventKind::IncomingData {
@@ -264,8 +272,7 @@ async fn handle_tcp_connection(
                         stats.bytes_client_to_server.fetch_add(n as u64, Ordering::Relaxed);
                         stats.packets_client_to_server.fetch_add(1, Ordering::Relaxed);
 
-                        // Capture if active
-                        capture.record(&rule_name, crate::capture::PacketDirection::ClientToServer, client_addr, target_addr, data).await;
+                        capture.record_with_filter(&rule_name, crate::capture::PacketDirection::ClientToServer, client_addr, target_addr, data, filter_name, false).await;
 
                         if let Some(ref mut dup) = dup_stream {
                             let _ = dup.write_all(data).await;
@@ -296,7 +303,7 @@ async fn handle_tcp_connection(
                         let (action, filter_idx) = apply_filters(filters, data, &Direction::ServerToClient);
                         if let Some(idx) = filter_idx {
                             stats.filter_matches.fetch_add(1, Ordering::Relaxed);
-                            let kind = if action == FilterAction::Drop {
+                            let kind = if action == FilterAction::Drop || action == FilterAction::DropConnection {
                                 EventKind::FilterDrop { rule: rule_name.clone(), filter_index: idx }
                             } else {
                                 EventKind::FilterMatch { rule: rule_name.clone(), filter_index: idx }
@@ -304,10 +311,18 @@ async fn handle_tcp_connection(
                             emit_event(&event_tx, &export_tx, stats, kind).await;
                         }
 
+                        let filter_name = filter_idx.map(|i| format!("filter#{i}"));
+
                         match action {
                             FilterAction::Drop => {
                                 stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                                capture.record_with_filter(&rule_name, crate::capture::PacketDirection::ServerToClient, target_addr, client_addr, data, filter_name, true).await;
                                 continue;
+                            }
+                            FilterAction::DropConnection => {
+                                stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                                capture.record_with_filter(&rule_name, crate::capture::PacketDirection::ServerToClient, target_addr, client_addr, data, filter_name, true).await;
+                                break;
                             }
                             FilterAction::TapOnly => {
                                 emit_event(&event_tx, &export_tx, stats, EventKind::OutgoingData {
@@ -322,7 +337,7 @@ async fn handle_tcp_connection(
                         stats.bytes_server_to_client.fetch_add(n as u64, Ordering::Relaxed);
                         stats.packets_server_to_client.fetch_add(1, Ordering::Relaxed);
 
-                        capture.record(&rule_name, crate::capture::PacketDirection::ServerToClient, target_addr, client_addr, data).await;
+                        capture.record_with_filter(&rule_name, crate::capture::PacketDirection::ServerToClient, target_addr, client_addr, data, filter_name, false).await;
                     }
                     _ = cancel.cancelled() => break,
                 }

@@ -769,6 +769,8 @@ async fn api_capture_packets(
             "payload_len": p.payload_len,
             "payload_hex": hex_encode(&p.payload),
             "payload_text": String::from_utf8_lossy(&p.payload),
+            "filter_matched": p.filter_matched,
+            "was_dropped": p.was_dropped,
         })
     }).collect();
     Ok(Json(serde_json::json!({ "packets": json_packets })))

@@ -244,6 +244,7 @@ fn convert_pipeline_node(n: &crate::config::schema::AppPipelineNode) -> Result<p
             let action = match c.get("action").and_then(|v| v.as_str()) {
                 Some("pass") => FilterAction::Pass,
                 Some("tap-only") | Some("tap_only") => FilterAction::TapOnly,
+                Some("drop_connection") => FilterAction::DropConnection,
                 _ => FilterAction::Drop,
             };
             let filter_kind = match kind_str {
@@ -322,6 +323,7 @@ fn convert_filter(
     let action_on_match = match f.action.as_deref() {
         Some("pass") | None => FilterAction::Pass,
         Some("drop") => FilterAction::Drop,
+        Some("drop_connection") => FilterAction::DropConnection,
         Some("tap") | Some("tap-only") | Some("tap_only") => FilterAction::TapOnly,
         Some(other) => bail!("unknown filter action '{}' in rule '{}'", other, rule_name),
     };

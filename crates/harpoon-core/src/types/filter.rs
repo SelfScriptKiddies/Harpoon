@@ -10,6 +10,8 @@ pub enum FilterAction {
     Pass,
     Drop,
     TapOnly,
+    /// Drop the entire connection (TCP: close, UDP: remove session).
+    DropConnection,
 }
 
 #[derive(Debug, Clone)]

@@ -189,7 +189,7 @@ async fn run_udp_inner(
                 }
 
                 match action {
-                    FilterAction::Drop => {
+                    FilterAction::Drop | FilterAction::DropConnection => {
                         stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
@@ -255,7 +255,7 @@ async fn run_udp_inner(
                                     }
 
                                     match action {
-                                        FilterAction::Drop => {
+                                        FilterAction::Drop | FilterAction::DropConnection => {
                                             recv_stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
                                             continue;
                                         }

@@ -254,7 +254,7 @@ fn process_dag_stages(
                 if let Some(_) = idx {
                     stats.filter_matches.fetch_add(1, Ordering::Relaxed);
                 }
-                if action == FilterAction::Drop {
+                if action == FilterAction::Drop || action == FilterAction::DropConnection {
                     return DagAction::Drop;
                 }
             }

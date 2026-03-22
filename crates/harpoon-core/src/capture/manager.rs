@@ -32,6 +32,10 @@ pub struct CapturedPacket {
     pub payload_len: usize,
     /// Payload truncated to max_payload_size.
     pub payload: Vec<u8>,
+    /// Name/index of the filter that matched (if any).
+    pub filter_matched: Option<String>,
+    /// Whether this packet was dropped by a filter.
+    pub was_dropped: bool,
 }
 
 /// Configuration for an active capture session.
@@ -59,7 +63,7 @@ pub struct CaptureManager {
 
 impl CaptureManager {
     pub fn new() -> Arc<Self> {
-        let (live_tx, _) = broadcast::channel(4096);
+        let (live_tx, _) = broadcast::channel(16384);
         Arc::new(Self {
             captures: Mutex::new(HashMap::new()),
             live_tx,
@@ -128,6 +132,20 @@ impl CaptureManager {
         dst: SocketAddr,
         payload: &[u8],
     ) {
+        self.record_with_filter(rule_name, direction, src, dst, payload, None, false).await;
+    }
+
+    /// Record a packet with filter metadata.
+    pub async fn record_with_filter(
+        &self,
+        rule_name: &str,
+        direction: PacketDirection,
+        src: SocketAddr,
+        dst: SocketAddr,
+        payload: &[u8],
+        filter_matched: Option<String>,
+        was_dropped: bool,
+    ) {
         let mut captures = self.captures.lock().await;
         let rc = match captures.get_mut(rule_name) {
             Some(rc) => rc,
@@ -152,6 +170,8 @@ impl CaptureManager {
             dst,
             payload_len: payload.len(),
             payload: truncated.to_vec(),
+            filter_matched,
+            was_dropped,
         };
 
         // Evict oldest if at capacity
