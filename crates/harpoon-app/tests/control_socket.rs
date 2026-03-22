@@ -43,6 +43,7 @@ async fn test_control_socket_full_workflow() {
             exporter: None,
             tls: None,
             udp_source_mode: harpoon_core::types::rule::UdpSourceMode::Proxy,
+            http2: false,
             idle_timeout_secs: 30,
         }],
         ..CoreConfig::default()

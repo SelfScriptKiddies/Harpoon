@@ -147,6 +147,7 @@ fn convert_rule(r: AppRule) -> Result<Rule> {
         exporter,
         tls,
         udp_source_mode,
+        http2: false,
         idle_timeout_secs,
     })
 }

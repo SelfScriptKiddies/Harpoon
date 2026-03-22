@@ -185,6 +185,7 @@ mod tests {
             exporter: None,
             tls: None,
             udp_source_mode: UdpSourceMode::Proxy,
+            http2: false,
             idle_timeout_secs: 30,
         }
     }

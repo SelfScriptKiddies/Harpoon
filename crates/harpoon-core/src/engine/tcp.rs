@@ -198,6 +198,21 @@ async fn handle_tcp_connection(
 
     let _ = upstream.set_nodelay(tcp_nodelay);
 
+    // HTTP/2 autodetect: if preface detected, use HTTP/2 executor
+    #[cfg(feature = "http2")]
+    {
+        if crate::engine::http2::peek_is_h2(&client_stream).await {
+            tracing::debug!(rule = rule_name, "HTTP/2 detected, switching to HTTP/2 executor");
+            // Drop the pre-connected upstream — h2 executor will connect its own
+            drop(upstream);
+            return crate::engine::http2::http2_proxy(
+                client_stream, client_addr, target_addr,
+                filters, stats, event_tx, export_tx, cancel,
+                rule_name, capture,
+            ).await;
+        }
+    }
+
     // Fast path: no filters, no duplicate — use zero-copy bidirectional copy
     if filters.is_empty() && dup_endpoint.is_none() {
         return fast_path_proxy(client_stream, upstream, stats, cancel).await;

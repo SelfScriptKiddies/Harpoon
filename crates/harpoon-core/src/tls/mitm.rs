@@ -179,6 +179,10 @@ where
                                 stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
                                 continue;
                             }
+                            FilterAction::DropConnection => {
+                                stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                                break;
+                            }
                             FilterAction::TapOnly => continue,
                             FilterAction::Pass => {}
                         }
@@ -224,6 +228,10 @@ where
                             FilterAction::Drop => {
                                 stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
                                 continue;
+                            }
+                            FilterAction::DropConnection => {
+                                stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                                break;
                             }
                             FilterAction::TapOnly => continue,
                             FilterAction::Pass => {}

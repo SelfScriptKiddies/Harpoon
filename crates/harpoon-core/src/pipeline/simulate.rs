@@ -159,6 +159,17 @@ pub fn simulate(pipeline: &Pipeline, payload: &[u8], direction: Direction) -> Si
                 });
             }
 
+            #[cfg(feature = "http2")]
+            NodeKind::Http2Decode(_) => {
+                steps.push(SimulationStep {
+                    node_id,
+                    node_kind: "http2_decode".into(),
+                    node_label: node.label.clone(),
+                    action: "decode".into(),
+                    detail: "HTTP/2 frame decoding".into(),
+                });
+            }
+
             NodeKind::Router(cfg) => {
                 let compiled: Vec<CompiledFilter> = vec![
                     CompiledFilter::new(cfg.filter.clone()).ok()

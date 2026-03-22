@@ -42,6 +42,10 @@ pub enum NodeKind {
 
     /// Conditional fan-out: match → one output, no match → another.
     Router(RouterConfig),
+
+    /// HTTP/2 decode: parse HTTP/2 frames, extract headers/body per stream.
+    #[cfg(feature = "http2")]
+    Http2Decode(Http2DecodeConfig),
 }
 
 impl NodeKind {
@@ -56,6 +60,11 @@ impl NodeKind {
         )
     }
 
+    #[cfg(feature = "http2")]
+    pub fn is_http2(&self) -> bool {
+        matches!(self, NodeKind::Http2Decode(_))
+    }
+
     pub fn kind_name(&self) -> &'static str {
         match self {
             NodeKind::Source(_) => "source",
@@ -67,6 +76,8 @@ impl NodeKind {
             NodeKind::Export(_) => "export",
             NodeKind::Drop => "drop",
             NodeKind::Router(_) => "router",
+            #[cfg(feature = "http2")]
+            NodeKind::Http2Decode(_) => "http2_decode",
         }
     }
 }
@@ -114,6 +125,10 @@ pub struct ExportNodeConfig {
 pub struct RouterConfig {
     pub filter: Filter,
 }
+
+#[cfg(feature = "http2")]
+#[derive(Debug, Clone)]
+pub struct Http2DecodeConfig {}
 
 #[derive(Debug, Clone)]
 pub struct Edge {

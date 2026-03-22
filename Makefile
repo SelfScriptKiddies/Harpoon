@@ -44,7 +44,7 @@ standard: build-web ## Build standard binary (web UI)
 
 full: build-web ## Build full-featured binary (web + tls + regex + transparent-udp)
 	@echo "Building harpoon-full..."
-	$(CARGO) build --release --features "web,tls,regex-filter,transparent-udp"
+	$(CARGO) build --release --features "web,tls,regex-filter,transparent-udp,http2"
 	@mkdir -p $(DIST_DIR)
 	cp $(TARGET_DIR)/release/harpoon $(DIST_DIR)/harpoon-full
 	@echo "Built: $(DIST_DIR)/harpoon-full"
@@ -115,10 +115,10 @@ test: ## Run all tests
 	$(CARGO) test
 
 check: ## Cargo check all features
-	$(CARGO) check --features "web,tls,regex-filter,transparent-udp"
+	$(CARGO) check --features "web,tls,regex-filter,transparent-udp,http2"
 
 clippy: ## Run clippy on all features
-	$(CARGO) clippy --features "web,tls,regex-filter,transparent-udp" -- -D warnings
+	$(CARGO) clippy --features "web,tls,regex-filter,transparent-udp,http2" -- -D warnings
 
 # ── Cleanup ───────────────────────────────────────────────────
 

@@ -60,6 +60,7 @@ pub struct Rule {
     pub exporter: Option<ExporterConfig>,
     pub tls: Option<TlsConfig>,
     pub udp_source_mode: UdpSourceMode,
+    pub http2: bool,
     pub idle_timeout_secs: u64,
 }
 

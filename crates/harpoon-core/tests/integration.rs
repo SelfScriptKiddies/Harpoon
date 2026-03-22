@@ -47,6 +47,7 @@ async fn test_tcp_proxy_basic() {
             exporter: None,
             tls: None,
             udp_source_mode: harpoon_core::types::rule::UdpSourceMode::Proxy,
+            http2: false,
             idle_timeout_secs: 30,
         }],
         ..CoreConfig::default()
@@ -108,6 +109,7 @@ async fn test_tcp_proxy_with_drop_filter() {
             exporter: None,
             tls: None,
             udp_source_mode: harpoon_core::types::rule::UdpSourceMode::Proxy,
+            http2: false,
             idle_timeout_secs: 30,
         }],
         ..CoreConfig::default()
@@ -170,6 +172,7 @@ async fn test_udp_relay_basic() {
             exporter: None,
             tls: None,
             udp_source_mode: harpoon_core::types::rule::UdpSourceMode::Proxy,
+            http2: false,
             idle_timeout_secs: 30,
         }],
         ..CoreConfig::default()
@@ -225,6 +228,7 @@ async fn test_udp_session_multiple_clients() {
             exporter: None,
             tls: None,
             udp_source_mode: harpoon_core::types::rule::UdpSourceMode::Proxy,
+            http2: false,
             idle_timeout_secs: 30,
         }],
         ..CoreConfig::default()
@@ -297,6 +301,7 @@ async fn test_tcp_proxy_stats() {
             exporter: None,
             tls: None,
             udp_source_mode: harpoon_core::types::rule::UdpSourceMode::Proxy,
+            http2: false,
             idle_timeout_secs: 30,
         }],
         ..CoreConfig::default()

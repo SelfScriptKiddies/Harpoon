@@ -178,6 +178,10 @@ fn compile_linear(
             NodeKind::Router(_) => {
                 return Err(CompileError::Internal("router in linear pipeline".into()));
             }
+            #[cfg(feature = "http2")]
+            NodeKind::Http2Decode(_) => {
+                has_processing = true;
+            }
         }
     }
 

@@ -1,6 +1,8 @@
 pub mod dag_executor;
 pub mod executor;
 pub mod filter;
+#[cfg(feature = "http2")]
+pub mod http2;
 pub mod tcp;
 pub mod udp;
 #[cfg(feature = "transparent-udp")]
