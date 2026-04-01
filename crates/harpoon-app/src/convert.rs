@@ -13,11 +13,77 @@ use harpoon_core::types::rule::{
 
 use crate::config::schema::{AppConfig, AppPipeline, AppRule};
 
+/// Port allowlist policy. Empty = all ports allowed.
+struct PortPolicy {
+    /// Sorted, non-overlapping ranges (inclusive).
+    ranges: Vec<(u16, u16)>,
+    allow_all: bool,
+}
+
+impl PortPolicy {
+    fn parse(spec: Option<&str>) -> Result<Self> {
+        let spec = match spec {
+            Some(s) if !s.trim().is_empty() => s.trim(),
+            _ => return Ok(Self { ranges: vec![], allow_all: true }),
+        };
+
+        let mut ranges = Vec::new();
+        for part in spec.split(',') {
+            let part = part.trim();
+            if part.is_empty() { continue; }
+            if let Some(dash) = part.find('-') {
+                let start: u16 = part[..dash].trim().parse()
+                    .with_context(|| format!("invalid port in allowed_ports: '{part}'"))?;
+                let end: u16 = part[dash + 1..].trim().parse()
+                    .with_context(|| format!("invalid port in allowed_ports: '{part}'"))?;
+                if end < start { bail!("invalid port range in allowed_ports: {start}-{end}"); }
+                ranges.push((start, end));
+            } else {
+                let port: u16 = part.parse()
+                    .with_context(|| format!("invalid port in allowed_ports: '{part}'"))?;
+                ranges.push((port, port));
+            }
+        }
+        ranges.sort();
+        Ok(Self { ranges, allow_all: false })
+    }
+
+    fn is_allowed(&self, port: u16) -> bool {
+        if self.allow_all { return true; }
+        self.ranges.iter().any(|&(lo, hi)| port >= lo && port <= hi)
+    }
+
+    fn check(&self, addr_str: &str, rule_name: &str) -> Result<()> {
+        if self.allow_all { return Ok(()); }
+        let port: u16 = addr_str
+            .rfind(':')
+            .and_then(|i| addr_str[i + 1..].parse().ok())
+            .unwrap_or(0);
+        if !self.is_allowed(port) {
+            bail!(
+                "port {port} not in allowed_ports for rule '{rule_name}'. Allowed: {}",
+                self.describe()
+            );
+        }
+        Ok(())
+    }
+
+    fn describe(&self) -> String {
+        if self.allow_all { return "all".into(); }
+        self.ranges.iter().map(|&(lo, hi)| {
+            if lo == hi { format!("{lo}") } else { format!("{lo}-{hi}") }
+        }).collect::<Vec<_>>().join(",")
+    }
+}
+
 pub fn convert(app: AppConfig) -> Result<CoreConfig> {
+    let port_policy = PortPolicy::parse(app.global.allowed_ports.as_deref())?;
+
     let mut rules = Vec::new();
     for r in app.rules {
         let expanded = expand_range_rule(r)?;
         for er in expanded {
+            port_policy.check(&er.listen, &er.name)?;
             rules.push(convert_rule(er)?);
         }
     }
@@ -603,6 +669,127 @@ mod tests {
         let expanded = expand_range_rule(r).unwrap();
         assert_eq!(expanded.len(), 1);
         assert_eq!(expanded[0].name, "normal");
+    }
+
+    #[test]
+    fn test_port_policy_allow_all() {
+        let p = PortPolicy::parse(None).unwrap();
+        assert!(p.is_allowed(1));
+        assert!(p.is_allowed(80));
+        assert!(p.is_allowed(65535));
+    }
+
+    #[test]
+    fn test_port_policy_specific() {
+        let p = PortPolicy::parse(Some("8082,10000-15000,40000-65535")).unwrap();
+        assert!(p.is_allowed(8082));
+        assert!(!p.is_allowed(8083));
+        assert!(p.is_allowed(10000));
+        assert!(p.is_allowed(12000));
+        assert!(p.is_allowed(15000));
+        assert!(!p.is_allowed(15001));
+        assert!(p.is_allowed(40000));
+        assert!(p.is_allowed(50000));
+        assert!(p.is_allowed(65535));
+        assert!(!p.is_allowed(80));
+        assert!(!p.is_allowed(39999));
+    }
+
+    #[test]
+    fn test_port_policy_blocks_rule() {
+        let app = AppConfig {
+            global: GlobalConfig {
+                allowed_ports: Some("10000-20000".into()),
+                ..GlobalConfig::default()
+            },
+            pipelines: vec![],
+            rules: vec![AppRule {
+                name: "blocked".into(),
+                protocol: "tcp".into(),
+                listen: "0.0.0.0:80".into(),
+                target: "10.0.0.1:80".into(),
+                filters: vec![],
+                duplicate: None,
+                exporter: None,
+                tls: None,
+                udp_source_mode: None,
+                idle_timeout_secs: None,
+            }],
+        };
+        assert!(convert(app).is_err());
+    }
+
+    #[test]
+    fn test_port_policy_allows_rule() {
+        let app = AppConfig {
+            global: GlobalConfig {
+                allowed_ports: Some("8080,10000-20000".into()),
+                ..GlobalConfig::default()
+            },
+            pipelines: vec![],
+            rules: vec![AppRule {
+                name: "ok".into(),
+                protocol: "tcp".into(),
+                listen: "0.0.0.0:8080".into(),
+                target: "10.0.0.1:80".into(),
+                filters: vec![],
+                duplicate: None,
+                exporter: None,
+                tls: None,
+                udp_source_mode: None,
+                idle_timeout_secs: None,
+            }],
+        };
+        assert!(convert(app).is_ok());
+    }
+
+    #[test]
+    fn test_port_policy_with_ranges() {
+        let app = AppConfig {
+            global: GlobalConfig {
+                allowed_ports: Some("3000-3010".into()),
+                ..GlobalConfig::default()
+            },
+            pipelines: vec![],
+            rules: vec![AppRule {
+                name: "range".into(),
+                protocol: "tcp".into(),
+                listen: "0.0.0.0:3000-3005".into(),
+                target: "10.0.0.1:4000-4005".into(),
+                filters: vec![],
+                duplicate: None,
+                exporter: None,
+                tls: None,
+                udp_source_mode: None,
+                idle_timeout_secs: None,
+            }],
+        };
+        assert!(convert(app).is_ok());
+    }
+
+    #[test]
+    fn test_port_policy_range_partially_blocked() {
+        let app = AppConfig {
+            global: GlobalConfig {
+                allowed_ports: Some("3000-3003".into()),
+                ..GlobalConfig::default()
+            },
+            pipelines: vec![],
+            rules: vec![AppRule {
+                name: "partial".into(),
+                protocol: "tcp".into(),
+                listen: "0.0.0.0:3000-3005".into(),
+                target: "10.0.0.1:4000-4005".into(),
+                filters: vec![],
+                duplicate: None,
+                exporter: None,
+                tls: None,
+                udp_source_mode: None,
+                idle_timeout_secs: None,
+            }],
+        };
+        // 3004 and 3005 are outside 3000-3003
+        assert!(convert(app).is_err());
     }
 
     #[test]

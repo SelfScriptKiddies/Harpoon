@@ -49,6 +49,9 @@ pub struct GlobalConfig {
     pub web_bind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub web_password: Option<String>,
+    /// Allowed listen ports. Format: "8082,10000-15000,40000-65535". Empty = all allowed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_ports: Option<String>,
     #[serde(default)]
     pub nft: NftConfig,
 }
