@@ -16,7 +16,10 @@ use crate::config::schema::{AppConfig, AppPipeline, AppRule};
 pub fn convert(app: AppConfig) -> Result<CoreConfig> {
     let mut rules = Vec::new();
     for r in app.rules {
-        rules.push(convert_rule(r)?);
+        let expanded = expand_range_rule(r)?;
+        for er in expanded {
+            rules.push(convert_rule(er)?);
+        }
     }
 
     let mut pipelines = Vec::new();
@@ -41,6 +44,91 @@ pub fn convert(app: AppConfig) -> Result<CoreConfig> {
     }
 
     Ok(config)
+}
+
+/// Parse "ip:port" or "ip:port_start-port_end" into (ip, port_start, port_end).
+fn parse_addr_range(s: &str) -> Result<(String, u16, u16)> {
+    // Find the last colon to split host and port part
+    let colon_idx = s.rfind(':').context("address must contain ':'")?;
+    let host = &s[..colon_idx];
+    let port_part = &s[colon_idx + 1..];
+
+    if let Some(dash_idx) = port_part.find('-') {
+        let start: u16 = port_part[..dash_idx].parse().context("invalid port range start")?;
+        let end: u16 = port_part[dash_idx + 1..].parse().context("invalid port range end")?;
+        if end < start {
+            bail!("port range end ({end}) must be >= start ({start})");
+        }
+        Ok((host.to_string(), start, end))
+    } else {
+        let port: u16 = port_part.parse().context("invalid port")?;
+        Ok((host.to_string(), port, port))
+    }
+}
+
+fn is_range_addr(s: &str) -> bool {
+    s.rfind(':')
+        .map(|i| s[i + 1..].contains('-'))
+        .unwrap_or(false)
+}
+
+/// Expand a rule with port ranges into multiple rules.
+/// "0.0.0.0:3000-3010" → "90.90.90.90:4000-4010" becomes 11 rules.
+/// Single target port → fan-in (all listen ports forward to one target).
+fn expand_range_rule(r: AppRule) -> Result<Vec<AppRule>> {
+    let listen_is_range = is_range_addr(&r.listen);
+    let target_is_range = is_range_addr(&r.target);
+
+    if !listen_is_range && !target_is_range {
+        return Ok(vec![r]);
+    }
+
+    let (listen_host, listen_start, listen_end) = parse_addr_range(&r.listen)
+        .with_context(|| format!("invalid listen range in rule '{}'", r.name))?;
+    let (target_host, target_start, target_end) = parse_addr_range(&r.target)
+        .with_context(|| format!("invalid target range in rule '{}'", r.name))?;
+
+    let listen_count = (listen_end - listen_start + 1) as usize;
+    let target_count = (target_end - target_start + 1) as usize;
+
+    // Validate range compatibility
+    if target_count > 1 && listen_count != target_count {
+        bail!(
+            "port range mismatch in rule '{}': listen has {} ports ({}–{}), target has {} ports ({}–{})",
+            r.name, listen_count, listen_start, listen_end, target_count, target_start, target_end
+        );
+    }
+
+    let mut expanded = Vec::with_capacity(listen_count);
+    for i in 0..listen_count {
+        let listen_port = listen_start + i as u16;
+        let target_port = if target_count == 1 {
+            target_start // fan-in: all → one target
+        } else {
+            target_start + i as u16
+        };
+
+        let suffix = if listen_count > 1 {
+            format!("/{listen_port}")
+        } else {
+            String::new()
+        };
+
+        expanded.push(AppRule {
+            name: format!("{}{suffix}", r.name),
+            protocol: r.protocol.clone(),
+            listen: format!("{listen_host}:{listen_port}"),
+            target: format!("{target_host}:{target_port}"),
+            filters: r.filters.clone(),
+            duplicate: r.duplicate.clone(),
+            exporter: r.exporter.clone(),
+            tls: r.tls.clone(),
+            udp_source_mode: r.udp_source_mode.clone(),
+            idle_timeout_secs: r.idle_timeout_secs,
+        });
+    }
+
+    Ok(expanded)
 }
 
 fn convert_rule(r: AppRule) -> Result<Rule> {
@@ -432,5 +520,115 @@ mod tests {
     fn test_hex_decode() {
         assert_eq!(hex_decode("deadbeef").unwrap(), vec![0xde, 0xad, 0xbe, 0xef]);
         assert!(hex_decode("xyz").is_err());
+    }
+
+    #[test]
+    fn test_range_expansion_1to1() {
+        let r = AppRule {
+            name: "range".into(),
+            protocol: "tcp".into(),
+            listen: "0.0.0.0:3000-3002".into(),
+            target: "10.0.0.1:4000-4002".into(),
+            filters: vec![],
+            duplicate: None,
+            exporter: None,
+            tls: None,
+            udp_source_mode: None,
+            idle_timeout_secs: None,
+        };
+        let expanded = expand_range_rule(r).unwrap();
+        assert_eq!(expanded.len(), 3);
+        assert_eq!(expanded[0].name, "range/3000");
+        assert_eq!(expanded[0].listen, "0.0.0.0:3000");
+        assert_eq!(expanded[0].target, "10.0.0.1:4000");
+        assert_eq!(expanded[1].listen, "0.0.0.0:3001");
+        assert_eq!(expanded[1].target, "10.0.0.1:4001");
+        assert_eq!(expanded[2].listen, "0.0.0.0:3002");
+        assert_eq!(expanded[2].target, "10.0.0.1:4002");
+    }
+
+    #[test]
+    fn test_range_expansion_fan_in() {
+        let r = AppRule {
+            name: "fanin".into(),
+            protocol: "udp".into(),
+            listen: "0.0.0.0:5000-5002".into(),
+            target: "10.0.0.1:9000".into(),
+            filters: vec![],
+            duplicate: None,
+            exporter: None,
+            tls: None,
+            udp_source_mode: None,
+            idle_timeout_secs: Some(30),
+        };
+        let expanded = expand_range_rule(r).unwrap();
+        assert_eq!(expanded.len(), 3);
+        // All target the same port
+        assert_eq!(expanded[0].target, "10.0.0.1:9000");
+        assert_eq!(expanded[1].target, "10.0.0.1:9000");
+        assert_eq!(expanded[2].target, "10.0.0.1:9000");
+    }
+
+    #[test]
+    fn test_range_mismatch_error() {
+        let r = AppRule {
+            name: "bad".into(),
+            protocol: "tcp".into(),
+            listen: "0.0.0.0:3000-3005".into(),
+            target: "10.0.0.1:4000-4002".into(),
+            filters: vec![],
+            duplicate: None,
+            exporter: None,
+            tls: None,
+            udp_source_mode: None,
+            idle_timeout_secs: None,
+        };
+        assert!(expand_range_rule(r).is_err());
+    }
+
+    #[test]
+    fn test_no_range_passthrough() {
+        let r = AppRule {
+            name: "normal".into(),
+            protocol: "tcp".into(),
+            listen: "0.0.0.0:8080".into(),
+            target: "10.0.0.1:80".into(),
+            filters: vec![],
+            duplicate: None,
+            exporter: None,
+            tls: None,
+            udp_source_mode: None,
+            idle_timeout_secs: None,
+        };
+        let expanded = expand_range_rule(r).unwrap();
+        assert_eq!(expanded.len(), 1);
+        assert_eq!(expanded[0].name, "normal");
+    }
+
+    #[test]
+    fn test_full_range_conversion() {
+        let app = AppConfig {
+            global: GlobalConfig::default(),
+            pipelines: vec![],
+            rules: vec![AppRule {
+                name: "game".into(),
+                protocol: "tcp".into(),
+                listen: "0.0.0.0:3000-3002".into(),
+                target: "90.90.90.90:4000-4002".into(),
+                filters: vec![],
+                duplicate: None,
+                exporter: None,
+                tls: None,
+                udp_source_mode: None,
+                idle_timeout_secs: None,
+            }],
+        };
+        let core = convert(app).unwrap();
+        assert_eq!(core.rules.len(), 3);
+        assert_eq!(core.rules[0].name, "game/3000");
+        assert_eq!(core.rules[0].listen.addr.port(), 3000);
+        assert_eq!(core.rules[0].target.addr.port(), 4000);
+        assert_eq!(core.rules[2].listen.addr.port(), 3002);
+        assert_eq!(core.rules[2].target.addr.port(), 4002);
     }
 }
