@@ -1,10 +1,11 @@
 //! HTTP/2 proxy executor — feature-gated behind `http2`.
 //!
-//! Proxies HTTP/2 connections with frame-level access:
+//! Proxies HTTP/2 connections with per-stream filtering and capture:
 //! - Parses HTTP/2 frames via the `h2` crate
-//! - Per-stream header/body access for filtering
-//! - Serializes request/response as HTTP/1.1-like text for capture
-//! - Falls back to raw TCP on parse failure
+//! - Applies filters to request/response headers (not body — binary protobuf isn't filterable)
+//! - Streams body frames incrementally (no full-body buffering)
+//! - Records headers + body prefix to capture
+//! - Forwards trailers (critical for gRPC: grpc-status, grpc-message)
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -27,6 +28,9 @@ use crate::types::stats::RuleStats;
 /// HTTP/2 connection preface (24 bytes).
 pub const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
+/// Max bytes of body to buffer for capture recording.
+const CAPTURE_BODY_PREFIX: usize = 8192;
+
 /// Check if the first bytes look like an HTTP/2 preface.
 pub async fn peek_is_h2(stream: &TcpStream) -> bool {
     let mut buf = [0u8; 24];
@@ -46,28 +50,37 @@ pub async fn http2_proxy(
     filters: &[CompiledFilter],
     stats: &RuleStats,
     event_tx: &broadcast::Sender<Event>,
-    export_tx: &Option<mpsc::Sender<Event>>,
+    _export_tx: &Option<mpsc::Sender<Event>>,
     cancel: &CancellationToken,
     rule_name: &str,
     capture: &Arc<CaptureManager>,
 ) -> Result<(), HarpoonError> {
-    // Server side: accept HTTP/2 from client
-    let mut h2_server = server::handshake(client_stream)
-        .await
+    // TCP_NODELAY is critical for HTTP/2 — Nagle can buffer small frames
+    // (SETTINGS, WINDOW_UPDATE, PING) causing handshake timeouts
+    let _ = client_stream.set_nodelay(true);
+
+    // Run server handshake and upstream TCP connect concurrently.
+    // server::handshake() reads client preface + SETTINGS and sends server SETTINGS.
+    // Doing both in parallel ensures the client gets SETTINGS ASAP.
+    let (h2_server_result, upstream_tcp_result) = tokio::join!(
+        server::handshake(client_stream),
+        TcpStream::connect(target_addr),
+    );
+
+    let mut h2_server = h2_server_result
         .map_err(|e| HarpoonError::Config(format!("HTTP/2 server handshake failed: {e}")))?;
+    let upstream = upstream_tcp_result
+        .map_err(|e| HarpoonError::UpstreamConnect { addr: target_addr, source: e })?;
 
     tracing::debug!(rule = rule_name, "HTTP/2 server handshake complete");
 
-    // Client side: connect to upstream as HTTP/2
-    let upstream = TcpStream::connect(target_addr)
-        .await
-        .map_err(|e| HarpoonError::UpstreamConnect { addr: target_addr, source: e })?;
-
+    // Upstream HTTP/2 handshake (sequential — server SETTINGS already sent to client)
+    let _ = upstream.set_nodelay(true);
     let (h2_client, h2_conn) = client::handshake(upstream)
         .await
         .map_err(|e| HarpoonError::Config(format!("HTTP/2 client handshake failed: {e}")))?;
 
-    // Spawn the client connection driver
+    // Spawn the upstream connection driver
     let conn_cancel = cancel.child_token();
     tokio::spawn(async move {
         tokio::select! {
@@ -95,7 +108,7 @@ pub async fn http2_proxy(
 
         let (head, mut body) = request.into_parts();
 
-        // Serialize request headers as HTTP/1.1-like text
+        // Serialize request headers as HTTP/1.1-like text for filtering and capture
         let method = head.method.to_string();
         let path = head.uri.path_and_query().map(|pq| pq.to_string()).unwrap_or_else(|| "/".into());
         let mut header_text = format!("{method} {path} HTTP/2\r\n");
@@ -105,14 +118,69 @@ pub async fn http2_proxy(
             }
         }
         header_text.push_str("\r\n");
+        let header_bytes = header_text.into_bytes();
 
-        // Collect request body
-        let mut req_body = Vec::new();
+        // Apply filters to headers BEFORE reading body — prevents OOM on blocked large payloads
+        let (action, filter_idx) = apply_filters(filters, &header_bytes, &Direction::ClientToServer);
+        if let Some(idx) = filter_idx {
+            stats.filter_matches.fetch_add(1, Ordering::Relaxed);
+            let kind = if action == FilterAction::Drop || action == FilterAction::DropConnection {
+                EventKind::FilterDrop { rule: rule_name.into(), filter_index: idx }
+            } else {
+                EventKind::FilterMatch { rule: rule_name.into(), filter_index: idx }
+            };
+            let _ = event_tx.send(Event::new(kind));
+        }
+
+        let filter_name = filter_idx.map(|i| format!("filter#{i}"));
+
+        if action == FilterAction::Drop || action == FilterAction::DropConnection {
+            stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+            capture.record_with_filter(
+                rule_name, PacketDirection::ClientToServer,
+                client_addr, target_addr, &header_bytes,
+                filter_name, true,
+            );
+            if action == FilterAction::DropConnection {
+                break;
+            }
+            // Send 403 back without reading body
+            let blocked = http::Response::builder().status(403).body(())
+                .map_err(|e| HarpoonError::Config(format!("HTTP/2 build 403: {e}")))?;
+            let mut send = respond.send_response(blocked, false)
+                .map_err(|e| HarpoonError::Config(format!("HTTP/2 send 403: {e}")))?;
+            let _ = send.send_data(Bytes::from_static(b"Blocked by filter"), true);
+            continue;
+        }
+
+        // Ensure upstream has capacity
+        h2_client = h2_client.ready().await
+            .map_err(|e| HarpoonError::Config(format!("HTTP/2 upstream not ready: {e}")))?;
+
+        // Forward request headers to upstream — body streamed below
+        let upstream_request = Request::from_parts(head, ());
+        let (resp_future, mut upstream_send) = match h2_client.send_request(upstream_request, false) {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::debug!(error = %e, "HTTP/2 upstream send error");
+                continue;
+            }
+        };
+
+        // Stream request body frames from client to upstream
+        let mut req_body_bytes: u64 = 0;
+        let mut capture_buf = header_bytes.clone();
         while let Some(chunk) = body.data().await {
             match chunk {
                 Ok(data) => {
                     let _ = body.flow_control().release_capacity(data.len());
-                    req_body.extend_from_slice(&data);
+                    req_body_bytes += data.len() as u64;
+                    // Capture body prefix
+                    if capture_buf.len() < header_bytes.len() + CAPTURE_BODY_PREFIX {
+                        let remaining = header_bytes.len() + CAPTURE_BODY_PREFIX - capture_buf.len();
+                        capture_buf.extend_from_slice(&data[..data.len().min(remaining)]);
+                    }
+                    let _ = upstream_send.send_data(data, false);
                 }
                 Err(e) => {
                     tracing::debug!(error = %e, "HTTP/2 request body error");
@@ -121,68 +189,29 @@ pub async fn http2_proxy(
             }
         }
 
-        // Full request for filtering
-        let mut full_request = header_text.as_bytes().to_vec();
-        full_request.extend_from_slice(&req_body);
-
-        // Apply filters to request
-        let (action, filter_idx) = apply_filters(filters, &full_request, &Direction::ClientToServer);
-        if let Some(idx) = filter_idx {
-            stats.filter_matches.fetch_add(1, Ordering::Relaxed);
-            let kind = if action == FilterAction::Drop || action == FilterAction::DropConnection {
-                EventKind::FilterDrop { rule: rule_name.into(), filter_index: idx }
-            } else {
-                EventKind::FilterMatch { rule: rule_name.into(), filter_index: idx }
-            };
-            let event = Event::new(kind);
-            let _ = event_tx.send(event);
+        // Forward request trailers or end stream
+        let req_trailers = body.trailers().await.unwrap_or(None);
+        if let Some(trailers) = req_trailers {
+            let _ = upstream_send.send_trailers(trailers);
+        } else {
+            let _ = upstream_send.send_data(Bytes::new(), true);
         }
 
-        // Record request to capture
-        let filter_name = filter_idx.map(|i| format!("filter#{i}"));
-        let was_dropped = action == FilterAction::Drop || action == FilterAction::DropConnection;
-        capture.record_with_filter(
-            rule_name, PacketDirection::ClientToServer,
-            client_addr, target_addr, &full_request,
-            filter_name.clone(), was_dropped,
-        ).await;
-
-        if was_dropped {
-            stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
-            if action == FilterAction::DropConnection {
-                break;
-            }
-            // Send 403 back and continue
-            let response = http::Response::builder()
-                .status(403)
-                .body(())
-                .unwrap();
-            let mut send = respond.send_response(response, false)
-                .map_err(|e| HarpoonError::Config(format!("HTTP/2 send response: {e}")))?;
-            let _ = send.send_data(Bytes::from_static(b"Blocked by filter"), true);
-            continue;
-        }
-
-        stats.bytes_client_to_server.fetch_add(full_request.len() as u64, Ordering::Relaxed);
+        stats.bytes_client_to_server.fetch_add(header_bytes.len() as u64 + req_body_bytes, Ordering::Relaxed);
         stats.packets_client_to_server.fetch_add(1, Ordering::Relaxed);
 
-        // Forward to upstream
-        let upstream_request = Request::from_parts(head, ());
-        let (response, mut upstream_body) = match h2_client.send_request(upstream_request, req_body.is_empty()) {
-            Ok((resp_future, mut send_stream)) => {
-                if !req_body.is_empty() {
-                    let _ = send_stream.send_data(Bytes::from(req_body), true);
-                }
-                match resp_future.await {
-                    Ok(resp) => resp.into_parts(),
-                    Err(e) => {
-                        tracing::debug!(error = %e, "HTTP/2 upstream response error");
-                        continue;
-                    }
-                }
-            }
+        // Record request to capture (headers + body prefix)
+        capture.record_with_filter(
+            rule_name, PacketDirection::ClientToServer,
+            client_addr, target_addr, &capture_buf,
+            filter_name, false,
+        );
+
+        // Wait for upstream response
+        let (response, mut upstream_body) = match resp_future.await {
+            Ok(resp) => resp.into_parts(),
             Err(e) => {
-                tracing::debug!(error = %e, "HTTP/2 upstream send error");
+                tracing::debug!(error = %e, "HTTP/2 upstream response error");
                 continue;
             }
         };
@@ -196,14 +225,44 @@ pub async fn http2_proxy(
             }
         }
         resp_header_text.push_str("\r\n");
+        let resp_header_bytes = resp_header_text.into_bytes();
 
-        // Collect response body
-        let mut resp_body = Vec::new();
+        // Apply filters to response headers
+        let (resp_action, resp_filter_idx) = apply_filters(filters, &resp_header_bytes, &Direction::ServerToClient);
+        let resp_filter_name = resp_filter_idx.map(|i| format!("filter#{i}"));
+        let resp_dropped = resp_action == FilterAction::Drop || resp_action == FilterAction::DropConnection;
+
+        // Build client response — forward all headers
+        let mut builder = http::Response::builder().status(status);
+        for (name, value) in &response.headers {
+            builder = builder.header(name, value);
+        }
+        let client_response = builder.body(())
+            .map_err(|e| HarpoonError::Config(format!("HTTP/2 build response: {e}")))?;
+
+        // Send response headers to client — body streamed below
+        let mut client_send = match respond.send_response(client_response, false) {
+            Ok(send) => send,
+            Err(e) => {
+                tracing::debug!(error = %e, "HTTP/2 send response headers error");
+                continue;
+            }
+        };
+
+        // Stream response body from upstream to client
+        let mut resp_body_bytes: u64 = 0;
+        let mut resp_capture_buf = resp_header_bytes.clone();
         while let Some(chunk) = upstream_body.data().await {
             match chunk {
                 Ok(data) => {
                     let _ = upstream_body.flow_control().release_capacity(data.len());
-                    resp_body.extend_from_slice(&data);
+                    resp_body_bytes += data.len() as u64;
+                    // Capture body prefix
+                    if resp_capture_buf.len() < resp_header_bytes.len() + CAPTURE_BODY_PREFIX {
+                        let remaining = resp_header_bytes.len() + CAPTURE_BODY_PREFIX - resp_capture_buf.len();
+                        resp_capture_buf.extend_from_slice(&data[..data.len().min(remaining)]);
+                    }
+                    let _ = client_send.send_data(data, false);
                 }
                 Err(e) => {
                     tracing::debug!(error = %e, "HTTP/2 response body error");
@@ -212,42 +271,23 @@ pub async fn http2_proxy(
             }
         }
 
-        let mut full_response = resp_header_text.as_bytes().to_vec();
-        full_response.extend_from_slice(&resp_body);
+        // Forward response trailers (critical for gRPC) or end stream
+        let resp_trailers = upstream_body.trailers().await.unwrap_or(None);
+        if let Some(trailers) = resp_trailers {
+            let _ = client_send.send_trailers(trailers);
+        } else {
+            let _ = client_send.send_data(Bytes::new(), true);
+        }
 
-        // Apply filters to response
-        let (resp_action, resp_filter_idx) = apply_filters(filters, &full_response, &Direction::ServerToClient);
-        let resp_filter_name = resp_filter_idx.map(|i| format!("filter#{i}"));
-        let resp_dropped = resp_action == FilterAction::Drop || resp_action == FilterAction::DropConnection;
-
-        // Record response to capture
-        capture.record_with_filter(
-            rule_name, PacketDirection::ServerToClient,
-            target_addr, client_addr, &full_response,
-            resp_filter_name, resp_dropped,
-        ).await;
-
-        stats.bytes_server_to_client.fetch_add(full_response.len() as u64, Ordering::Relaxed);
+        stats.bytes_server_to_client.fetch_add(resp_header_bytes.len() as u64 + resp_body_bytes, Ordering::Relaxed);
         stats.packets_server_to_client.fetch_add(1, Ordering::Relaxed);
 
-        // Send response back to client
-        let client_response = http::Response::builder()
-            .status(status)
-            .body(())
-            .unwrap();
-        // Copy response headers
-        // Note: h2 handles header forwarding through the response builder
-        match respond.send_response(client_response, resp_body.is_empty()) {
-            Ok(mut send) => {
-                if !resp_body.is_empty() {
-                    let _ = send.send_data(Bytes::from(resp_body), true);
-                }
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "HTTP/2 send response to client error");
-                continue;
-            }
-        }
+        // Record response to capture (headers + body prefix)
+        capture.record_with_filter(
+            rule_name, PacketDirection::ServerToClient,
+            target_addr, client_addr, &resp_capture_buf,
+            resp_filter_name, resp_dropped,
+        );
 
         if resp_action == FilterAction::DropConnection {
             break;

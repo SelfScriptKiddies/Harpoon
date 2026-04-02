@@ -721,7 +721,7 @@ async fn api_capture_start(
     Json(req): Json<CaptureStartReq>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     require_auth!(state, headers);
-    match state.capture.start(req.rule, req.max_packets, req.max_payload_size, req.timeout_secs).await {
+    match state.capture.start(req.rule, req.max_packets, req.max_payload_size, req.timeout_secs) {
         Ok(()) => Ok(Json(serde_json::json!({"ok": true}))),
         Err(e) => Ok(Json(serde_json::json!({"ok": false, "error": e}))),
     }
@@ -736,7 +736,7 @@ async fn api_capture_stop(
     Json(req): Json<CaptureStopReq>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     require_auth!(state, headers);
-    match state.capture.stop(&req.rule).await {
+    match state.capture.stop(&req.rule) {
         Ok(packets) => Ok(Json(serde_json::json!({"ok": true, "packets_captured": packets.len()}))),
         Err(e) => Ok(Json(serde_json::json!({"ok": false, "error": e}))),
     }
@@ -758,7 +758,7 @@ async fn api_capture_packets(
     axum::extract::Query(q): axum::extract::Query<CapturePacketsQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     require_auth!(state, headers);
-    let packets = state.capture.get_packets(&q.rule, q.offset, q.limit).await;
+    let packets = state.capture.get_packets(&q.rule, q.offset, q.limit);
     let json_packets: Vec<serde_json::Value> = packets.iter().map(|p| {
         serde_json::json!({
             "timestamp_ms": p.timestamp_ms,
@@ -781,7 +781,7 @@ async fn api_capture_sessions(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     require_auth!(state, headers);
-    let sessions = state.capture.list_sessions().await;
+    let sessions = state.capture.list_sessions();
     let json: Vec<serde_json::Value> = sessions.iter().map(|s| {
         serde_json::json!({
             "rule": s.rule_name,

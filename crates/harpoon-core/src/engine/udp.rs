@@ -39,7 +39,8 @@ pub async fn run_udp_pipeline(
         params.name, params.listen_addr, params.target_addr,
         params.filters, params.duplicate_addr,
         params.udp_source_mode, params.idle_timeout_secs,
-        params.max_datagram, params.capture, stats, event_tx, export_tx, cancel,
+        params.max_datagram, params.capture, stats, event_tx, export_tx,
+        cancel, params.force_cancel,
     ).await
 }
 
@@ -53,12 +54,13 @@ pub async fn run_udp_rule(
     cancel: CancellationToken,
     max_datagram: usize,
 ) -> Result<(), HarpoonError> {
+    let force = cancel.child_token();
     run_udp_inner(
         rule.name.clone(), rule.listen.addr, rule.target.addr,
         filters, rule.duplicate.as_ref().map(|d| d.endpoint.addr),
         rule.udp_source_mode.clone(), rule.idle_timeout_secs,
         max_datagram, crate::capture::CaptureManager::new(),
-        stats, event_tx, export_tx, cancel,
+        stats, event_tx, export_tx, cancel, force,
     ).await
 }
 
@@ -77,6 +79,7 @@ async fn run_udp_inner(
     event_tx: broadcast::Sender<Event>,
     export_tx: Option<mpsc::Sender<Event>>,
     cancel: CancellationToken,
+    force_cancel: CancellationToken,
 ) -> Result<(), HarpoonError> {
     let listener = Arc::new(
         UdpSocket::bind(listen_addr)
@@ -214,7 +217,7 @@ async fn run_udp_inner(
                         }
                     };
 
-                    let session_cancel = cancel.child_token();
+                    let session_cancel = force_cancel.child_token();
 
                     // Spawn reverse path task
                     let recv_socket = upstream_socket.clone();
