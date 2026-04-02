@@ -1,9 +1,16 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::{broadcast, Mutex};
+use bytes::Bytes;
+use dashmap::DashMap;
+use tokio::sync::broadcast;
+
+const BROADCAST_CAPACITY: usize = 16384;
+/// Skip live broadcast when channel exceeds this fill level (75%).
+const BROADCAST_PRESSURE_THRESHOLD: usize = BROADCAST_CAPACITY * 3 / 4;
 
 /// Direction of captured packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,8 +37,8 @@ pub struct CapturedPacket {
     pub src: SocketAddr,
     pub dst: SocketAddr,
     pub payload_len: usize,
-    /// Payload truncated to max_payload_size.
-    pub payload: Vec<u8>,
+    /// Payload truncated to max_payload_size. Bytes is O(1) to clone.
+    pub payload: Bytes,
     /// Name/index of the filter that matched (if any).
     pub filter_matched: Option<String>,
     /// Whether this packet was dropped by a filter.
@@ -55,40 +62,47 @@ struct RuleCapture {
 }
 
 /// The capture manager — shared across all engine tasks.
+/// Uses DashMap for per-shard locking instead of a global Mutex.
 pub struct CaptureManager {
-    captures: Mutex<HashMap<String, RuleCapture>>,
+    captures: DashMap<String, RuleCapture>,
     /// Broadcast for real-time streaming to WebSocket clients.
     live_tx: broadcast::Sender<CapturedPacket>,
+    /// Packets skipped from broadcast due to backpressure.
+    broadcast_drops: AtomicU64,
 }
 
 impl CaptureManager {
     pub fn new() -> Arc<Self> {
-        let (live_tx, _) = broadcast::channel(16384);
+        let (live_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         Arc::new(Self {
-            captures: Mutex::new(HashMap::new()),
+            captures: DashMap::new(),
             live_tx,
+            broadcast_drops: AtomicU64::new(0),
         })
     }
 
+    /// Number of packets skipped from live broadcast due to backpressure.
+    pub fn broadcast_drops(&self) -> u64 {
+        self.broadcast_drops.load(Ordering::Relaxed)
+    }
+
     /// Start capturing for a rule. Returns error if already capturing.
-    pub async fn start(
+    pub fn start(
         &self,
         rule_name: String,
         max_packets: usize,
         max_payload_size: usize,
         timeout_secs: u64,
     ) -> Result<(), String> {
-        let mut captures = self.captures.lock().await;
-
         // Clean expired sessions
         let now = Instant::now();
-        captures.retain(|_, rc| now.duration_since(rc.session.started_at) < rc.session.timeout);
+        self.captures.retain(|_, rc| now.duration_since(rc.session.started_at) < rc.session.timeout);
 
-        if captures.contains_key(&rule_name) {
+        if self.captures.contains_key(&rule_name) {
             return Err(format!("capture already active for rule '{rule_name}'"));
         }
 
-        captures.insert(
+        self.captures.insert(
             rule_name.clone(),
             RuleCapture {
                 session: CaptureSession {
@@ -105,26 +119,23 @@ impl CaptureManager {
     }
 
     /// Stop capturing for a rule.
-    pub async fn stop(&self, rule_name: &str) -> Result<Vec<CapturedPacket>, String> {
-        let mut captures = self.captures.lock().await;
-        match captures.remove(rule_name) {
-            Some(rc) => Ok(rc.packets.into()),
+    pub fn stop(&self, rule_name: &str) -> Result<Vec<CapturedPacket>, String> {
+        match self.captures.remove(rule_name) {
+            Some((_, rc)) => Ok(rc.packets.into()),
             None => Err(format!("no active capture for rule '{rule_name}'")),
         }
     }
 
-    /// Check if capture is active for a rule. Fast path — avoids lock if no captures.
-    pub async fn is_active(&self, rule_name: &str) -> bool {
-        let captures = self.captures.lock().await;
-        if let Some(rc) = captures.get(rule_name) {
-            Instant::now().duration_since(rc.session.started_at) < rc.session.timeout
-        } else {
-            false
+    /// Check if capture is active for a rule.
+    pub fn is_active(&self, rule_name: &str) -> bool {
+        match self.captures.get(rule_name) {
+            Some(rc) => Instant::now().duration_since(rc.session.started_at) < rc.session.timeout,
+            None => false,
         }
     }
 
     /// Record a packet. Called from engine hot path — only when capture is active.
-    pub async fn record(
+    pub fn record(
         &self,
         rule_name: &str,
         direction: PacketDirection,
@@ -132,11 +143,11 @@ impl CaptureManager {
         dst: SocketAddr,
         payload: &[u8],
     ) {
-        self.record_with_filter(rule_name, direction, src, dst, payload, None, false).await;
+        self.record_with_filter(rule_name, direction, src, dst, payload, None, false);
     }
 
     /// Record a packet with filter metadata.
-    pub async fn record_with_filter(
+    pub fn record_with_filter(
         &self,
         rule_name: &str,
         direction: PacketDirection,
@@ -146,8 +157,7 @@ impl CaptureManager {
         filter_matched: Option<String>,
         was_dropped: bool,
     ) {
-        let mut captures = self.captures.lock().await;
-        let rc = match captures.get_mut(rule_name) {
+        let mut rc = match self.captures.get_mut(rule_name) {
             Some(rc) => rc,
             None => return,
         };
@@ -169,7 +179,7 @@ impl CaptureManager {
             src,
             dst,
             payload_len: payload.len(),
-            payload: truncated.to_vec(),
+            payload: Bytes::copy_from_slice(truncated),
             filter_matched,
             was_dropped,
         };
@@ -180,19 +190,25 @@ impl CaptureManager {
         }
         rc.packets.push_back(packet.clone());
 
-        // Broadcast for WebSocket
-        let _ = self.live_tx.send(packet);
+        // Drop the DashMap guard before broadcast to minimize lock hold time
+        drop(rc);
+
+        // Adaptive broadcast: skip when channel is under pressure
+        if self.live_tx.len() < BROADCAST_PRESSURE_THRESHOLD {
+            let _ = self.live_tx.send(packet);
+        } else {
+            self.broadcast_drops.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Get captured packets for a rule.
-    pub async fn get_packets(
+    pub fn get_packets(
         &self,
         rule_name: &str,
         offset: usize,
         limit: usize,
     ) -> Vec<CapturedPacket> {
-        let captures = self.captures.lock().await;
-        match captures.get(rule_name) {
+        match self.captures.get(rule_name) {
             Some(rc) => rc
                 .packets
                 .iter()
@@ -205,18 +221,17 @@ impl CaptureManager {
     }
 
     /// List active capture sessions.
-    pub async fn list_sessions(&self) -> Vec<CaptureSessionInfo> {
-        let captures = self.captures.lock().await;
+    pub fn list_sessions(&self) -> Vec<CaptureSessionInfo> {
         let now = Instant::now();
-        captures
-            .values()
-            .filter(|rc| now.duration_since(rc.session.started_at) < rc.session.timeout)
-            .map(|rc| CaptureSessionInfo {
-                rule_name: rc.session.rule_name.clone(),
-                packets_captured: rc.packets.len(),
-                max_packets: rc.session.max_packets,
-                elapsed_secs: now.duration_since(rc.session.started_at).as_secs(),
-                timeout_secs: rc.session.timeout.as_secs(),
+        self.captures
+            .iter()
+            .filter(|entry| now.duration_since(entry.session.started_at) < entry.session.timeout)
+            .map(|entry| CaptureSessionInfo {
+                rule_name: entry.session.rule_name.clone(),
+                packets_captured: entry.packets.len(),
+                max_packets: entry.session.max_packets,
+                elapsed_secs: now.duration_since(entry.session.started_at).as_secs(),
+                timeout_secs: entry.session.timeout.as_secs(),
             })
             .collect()
     }
