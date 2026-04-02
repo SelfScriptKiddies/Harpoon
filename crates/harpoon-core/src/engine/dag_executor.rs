@@ -28,6 +28,7 @@ pub async fn run_dag_tcp(
     event_tx: broadcast::Sender<Event>,
     export_tx: Option<mpsc::Sender<Event>>,
     cancel: CancellationToken,
+    force_cancel: CancellationToken,
     buffer_size: usize,
     tcp_nodelay: bool,
     capture: Arc<CaptureManager>,
@@ -78,7 +79,7 @@ pub async fn run_dag_tcp(
                 let stats = stats.clone();
                 let event_tx = event_tx.clone();
                 let export_tx = export_tx.clone();
-                let cancel = cancel.child_token();
+                let conn_cancel = force_cancel.child_token();
                 let name = name.clone();
                 let stages = stages.clone();
                 let compiled_stages = compiled_stages.clone();
@@ -89,7 +90,7 @@ pub async fn run_dag_tcp(
                     if let Err(e) = handle_dag_connection(
                         client_stream, client_addr, &stages, &compiled_stages,
                         &forward_addrs, &stats, &event_tx, &export_tx,
-                        &cancel, buffer_size, &name, &capture,
+                        &conn_cancel, buffer_size, &name, &capture,
                     ).await {
                         tracing::debug!(pipeline = %name, error = %e, "dag connection ended");
                     }
@@ -167,7 +168,7 @@ async fn handle_dag_connection(
                                 upstream_write.write_all(data).await?;
                                 stats.bytes_client_to_server.fetch_add(n as u64, Ordering::Relaxed);
                                 stats.packets_client_to_server.fetch_add(1, Ordering::Relaxed);
-                                capture.record(&name, crate::capture::PacketDirection::ClientToServer, client_addr, target, data).await;
+                                capture.record(&name, crate::capture::PacketDirection::ClientToServer, client_addr, target, data);
                             }
                             DagAction::Drop => {
                                 stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
@@ -208,7 +209,7 @@ async fn handle_dag_connection(
                                 client_write.write_all(data).await?;
                                 stats.bytes_server_to_client.fetch_add(n as u64, Ordering::Relaxed);
                                 stats.packets_server_to_client.fetch_add(1, Ordering::Relaxed);
-                                capture.record(&name, crate::capture::PacketDirection::ServerToClient, target, client_addr, data).await;
+                                capture.record(&name, crate::capture::PacketDirection::ServerToClient, target, client_addr, data);
                             }
                             DagAction::Drop => {
                                 stats.dropped_packets.fetch_add(1, Ordering::Relaxed);

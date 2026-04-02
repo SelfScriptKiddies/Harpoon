@@ -28,6 +28,8 @@ pub struct TcpParams {
     pub buffer_size: usize,
     pub tcp_nodelay: bool,
     pub capture: Arc<CaptureManager>,
+    /// Force-cancel token for active connections (graceful drain).
+    pub force_cancel: CancellationToken,
     #[cfg(feature = "tls")]
     pub ca: Option<Arc<CertAuthority>>,
     #[cfg(feature = "tls")]
@@ -44,6 +46,8 @@ pub struct UdpParams {
     pub filters: Arc<Vec<CompiledFilter>>,
     pub duplicate_addr: Option<SocketAddr>,
     pub capture: Arc<CaptureManager>,
+    /// Force-cancel token for active sessions (graceful drain).
+    pub force_cancel: CancellationToken,
     pub udp_source_mode: UdpSourceMode,
     pub idle_timeout_secs: u64,
     pub max_datagram: usize,
@@ -55,6 +59,7 @@ pub fn spawn_plan(
     stats: Arc<RuleStats>,
     event_tx: broadcast::Sender<Event>,
     cancel: CancellationToken,
+    force_cancel: CancellationToken,
     buffer_size: usize,
     max_datagram: usize,
     tcp_nodelay: bool,
@@ -65,21 +70,21 @@ pub fn spawn_plan(
     match plan {
         ExecutionPlan::FastForward(p) => {
             spawn_fast_forward(
-                p, stats, event_tx, cancel, buffer_size, max_datagram,
+                p, stats, event_tx, cancel, force_cancel, buffer_size, max_datagram,
                 tcp_nodelay, export_channel_capacity, capture,
                 #[cfg(feature = "tls")] ca,
             )
         }
         ExecutionPlan::Linear(p) => {
             spawn_linear(
-                p, stats, event_tx, cancel, buffer_size, max_datagram,
+                p, stats, event_tx, cancel, force_cancel, buffer_size, max_datagram,
                 tcp_nodelay, export_channel_capacity, capture,
                 #[cfg(feature = "tls")] ca,
             )
         }
         ExecutionPlan::Dag(p) => {
             spawn_dag(
-                p, stats, event_tx, cancel, buffer_size, max_datagram,
+                p, stats, event_tx, cancel, force_cancel, buffer_size, max_datagram,
                 tcp_nodelay, export_channel_capacity, capture,
                 #[cfg(feature = "tls")] ca,
             )
@@ -92,6 +97,7 @@ fn spawn_fast_forward(
     stats: Arc<RuleStats>,
     event_tx: broadcast::Sender<Event>,
     cancel: CancellationToken,
+    force_cancel: CancellationToken,
     buffer_size: usize,
     max_datagram: usize,
     tcp_nodelay: bool,
@@ -111,6 +117,7 @@ fn spawn_fast_forward(
                 buffer_size,
                 tcp_nodelay,
                 capture: capture.clone(),
+                force_cancel,
                 #[cfg(feature = "tls")] ca: None,
                 #[cfg(feature = "tls")] tls_terminate: false,
                 #[cfg(feature = "tls")] tls_initiate: false,
@@ -127,6 +134,7 @@ fn spawn_fast_forward(
                 filters: Arc::new(vec![]),
                 duplicate_addr: None,
                 capture: capture.clone(),
+                force_cancel,
                 udp_source_mode: plan.source.udp_source_mode,
                 idle_timeout_secs: plan.source.idle_timeout_secs,
                 max_datagram,
@@ -143,6 +151,7 @@ fn spawn_linear(
     stats: Arc<RuleStats>,
     event_tx: broadcast::Sender<Event>,
     cancel: CancellationToken,
+    force_cancel: CancellationToken,
     buffer_size: usize,
     max_datagram: usize,
     tcp_nodelay: bool,
@@ -178,6 +187,7 @@ fn spawn_linear(
                 buffer_size,
                 tcp_nodelay,
                 capture: capture.clone(),
+                force_cancel,
                 #[cfg(feature = "tls")]
                 ca,
                 #[cfg(feature = "tls")]
@@ -197,6 +207,7 @@ fn spawn_linear(
                 filters: Arc::new(filters),
                 duplicate_addr: dup_addr,
                 capture: capture.clone(),
+                force_cancel,
                 udp_source_mode: plan.source.udp_source_mode,
                 idle_timeout_secs: plan.source.idle_timeout_secs,
                 max_datagram,
@@ -213,12 +224,13 @@ fn spawn_dag(
     stats: Arc<RuleStats>,
     event_tx: broadcast::Sender<Event>,
     cancel: CancellationToken,
+    force_cancel: CancellationToken,
     buffer_size: usize,
     max_datagram: usize,
     tcp_nodelay: bool,
     export_channel_capacity: usize,
     capture: Arc<CaptureManager>,
-    #[cfg(feature = "tls")] ca: Option<Arc<CertAuthority>>,
+    #[cfg(feature = "tls")] _ca: Option<Arc<CertAuthority>>,
 ) -> JoinHandle<Result<(), HarpoonError>> {
     let proto = plan.source.endpoint.protocol;
 
@@ -236,7 +248,7 @@ fn spawn_dag(
     match proto {
         Protocol::Tcp => {
             tokio::spawn(super::dag_executor::run_dag_tcp(
-                plan, stats, event_tx, export_tx, cancel,
+                plan, stats, event_tx, export_tx, cancel, force_cancel,
                 buffer_size, tcp_nodelay, capture,
             ))
         }
@@ -260,6 +272,7 @@ fn spawn_dag(
                         filters: Arc::new(filters),
                         duplicate_addr: None,
                         capture,
+                        force_cancel,
                         udp_source_mode: plan.source.udp_source_mode,
                         idle_timeout_secs: plan.source.idle_timeout_secs,
                         max_datagram,

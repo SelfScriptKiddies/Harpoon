@@ -45,6 +45,7 @@ pub async fn run_tcp_pipeline(
     let capture = params.capture;
     let buffer_size = params.buffer_size;
     let tcp_nodelay = params.tcp_nodelay;
+    let force_cancel = params.force_cancel;
 
     #[cfg(feature = "tls")]
     let ca = params.ca;
@@ -75,7 +76,7 @@ pub async fn run_tcp_pipeline(
                 let filters = filters.clone();
                 let event_tx = event_tx.clone();
                 let export_tx = export_tx.clone();
-                let cancel = cancel.child_token();
+                let conn_cancel = force_cancel.child_token();
                 let name = name.clone();
                 let capture = capture.clone();
 
@@ -96,7 +97,7 @@ pub async fn run_tcp_pipeline(
                                     crate::tls::mitm::handle_tls_connection(
                                         client_stream, client_addr, target_addr,
                                         &mode, ca, &filters, &stats,
-                                        &event_tx, &export_tx, &cancel,
+                                        &event_tx, &export_tx, &conn_cancel,
                                         buffer_size, &name,
                                     ).await
                                 } else {
@@ -106,7 +107,7 @@ pub async fn run_tcp_pipeline(
                                 handle_tcp_connection(
                                     client_stream, client_addr, target_addr,
                                     dup_endpoint, &filters, &stats,
-                                    &event_tx, &export_tx, &cancel,
+                                    &event_tx, &export_tx, &conn_cancel,
                                     buffer_size, tcp_nodelay, &name, &capture,
                                 ).await
                             }
@@ -116,7 +117,7 @@ pub async fn run_tcp_pipeline(
                             handle_tcp_connection(
                                 client_stream, client_addr, target_addr,
                                 dup_endpoint, &filters, &stats,
-                                &event_tx, &export_tx, &cancel,
+                                &event_tx, &export_tx, &conn_cancel,
                                 buffer_size, tcp_nodelay, &name, &capture,
                             ).await
                         }
@@ -163,6 +164,7 @@ pub async fn run_tcp_rule(
         buffer_size,
         tcp_nodelay,
         capture: crate::capture::CaptureManager::new(),
+        force_cancel: cancel.child_token(),
         #[cfg(feature = "tls")]
         ca,
         #[cfg(feature = "tls")]
@@ -189,6 +191,19 @@ async fn handle_tcp_connection(
     rule_name: &str,
     capture: &Arc<crate::capture::CaptureManager>,
 ) -> Result<(), HarpoonError> {
+    // HTTP/2 autodetect: check BEFORE upstream connect to avoid double-connect
+    #[cfg(feature = "http2")]
+    {
+        if crate::engine::http2::peek_is_h2(&client_stream).await {
+            tracing::debug!(rule = rule_name, "HTTP/2 detected, switching to HTTP/2 executor");
+            return crate::engine::http2::http2_proxy(
+                client_stream, client_addr, target_addr,
+                filters, stats, event_tx, export_tx, cancel,
+                rule_name, capture,
+            ).await;
+        }
+    }
+
     let upstream = TcpStream::connect(target_addr)
         .await
         .map_err(|e| HarpoonError::UpstreamConnect {
@@ -197,21 +212,6 @@ async fn handle_tcp_connection(
         })?;
 
     let _ = upstream.set_nodelay(tcp_nodelay);
-
-    // HTTP/2 autodetect: if preface detected, use HTTP/2 executor
-    #[cfg(feature = "http2")]
-    {
-        if crate::engine::http2::peek_is_h2(&client_stream).await {
-            tracing::debug!(rule = rule_name, "HTTP/2 detected, switching to HTTP/2 executor");
-            // Drop the pre-connected upstream — h2 executor will connect its own
-            drop(upstream);
-            return crate::engine::http2::http2_proxy(
-                client_stream, client_addr, target_addr,
-                filters, stats, event_tx, export_tx, cancel,
-                rule_name, capture,
-            ).await;
-        }
-    }
 
     // Fast path: no filters, no duplicate — use zero-copy bidirectional copy
     if filters.is_empty() && dup_endpoint.is_none() {
@@ -266,12 +266,12 @@ async fn handle_tcp_connection(
                         match action {
                             FilterAction::Drop => {
                                 stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
-                                capture.record_with_filter(&rule_name, crate::capture::PacketDirection::ClientToServer, client_addr, target_addr, data, filter_name, true).await;
+                                capture.record_with_filter(&rule_name, crate::capture::PacketDirection::ClientToServer, client_addr, target_addr, data, filter_name, true);
                                 continue;
                             }
                             FilterAction::DropConnection => {
                                 stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
-                                capture.record_with_filter(&rule_name, crate::capture::PacketDirection::ClientToServer, client_addr, target_addr, data, filter_name, true).await;
+                                capture.record_with_filter(&rule_name, crate::capture::PacketDirection::ClientToServer, client_addr, target_addr, data, filter_name, true);
                                 break;
                             }
                             FilterAction::TapOnly => {
@@ -287,7 +287,7 @@ async fn handle_tcp_connection(
                         stats.bytes_client_to_server.fetch_add(n as u64, Ordering::Relaxed);
                         stats.packets_client_to_server.fetch_add(1, Ordering::Relaxed);
 
-                        capture.record_with_filter(&rule_name, crate::capture::PacketDirection::ClientToServer, client_addr, target_addr, data, filter_name, false).await;
+                        capture.record_with_filter(&rule_name, crate::capture::PacketDirection::ClientToServer, client_addr, target_addr, data, filter_name, false);
 
                         if let Some(ref mut dup) = dup_stream {
                             let _ = dup.write_all(data).await;
@@ -331,12 +331,12 @@ async fn handle_tcp_connection(
                         match action {
                             FilterAction::Drop => {
                                 stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
-                                capture.record_with_filter(&rule_name, crate::capture::PacketDirection::ServerToClient, target_addr, client_addr, data, filter_name, true).await;
+                                capture.record_with_filter(&rule_name, crate::capture::PacketDirection::ServerToClient, target_addr, client_addr, data, filter_name, true);
                                 continue;
                             }
                             FilterAction::DropConnection => {
                                 stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
-                                capture.record_with_filter(&rule_name, crate::capture::PacketDirection::ServerToClient, target_addr, client_addr, data, filter_name, true).await;
+                                capture.record_with_filter(&rule_name, crate::capture::PacketDirection::ServerToClient, target_addr, client_addr, data, filter_name, true);
                                 break;
                             }
                             FilterAction::TapOnly => {
@@ -352,7 +352,7 @@ async fn handle_tcp_connection(
                         stats.bytes_server_to_client.fetch_add(n as u64, Ordering::Relaxed);
                         stats.packets_server_to_client.fetch_add(1, Ordering::Relaxed);
 
-                        capture.record_with_filter(&rule_name, crate::capture::PacketDirection::ServerToClient, target_addr, client_addr, data, filter_name, false).await;
+                        capture.record_with_filter(&rule_name, crate::capture::PacketDirection::ServerToClient, target_addr, client_addr, data, filter_name, false);
                     }
                     _ = cancel.cancelled() => break,
                 }

@@ -26,7 +26,10 @@ use crate::types::stats::{RuleStats, RuleStatsSnapshot};
 use crate::tls::cert::CertAuthority;
 
 pub struct EngineHandle {
-    cancel: CancellationToken,
+    /// Stops accept/listen loops — no new connections accepted.
+    accept_cancel: CancellationToken,
+    /// Force-kills active connections after drain timeout.
+    force_cancel: CancellationToken,
     event_tx: broadcast::Sender<Event>,
     stats: Vec<(String, Arc<RuleStats>)>,
     join_handles: Vec<JoinHandle<Result<(), HarpoonError>>>,
@@ -35,14 +38,36 @@ pub struct EngineHandle {
 }
 
 impl EngineHandle {
+    /// Stop accepting new connections. Active connections continue until drain.
     pub fn stop(&self) {
-        self.cancel.cancel();
+        self.accept_cancel.cancel();
     }
 
+    /// Graceful shutdown: stop accepting, drain active connections (3s), force-kill.
     pub async fn shutdown(self) -> Vec<Result<(), HarpoonError>> {
-        self.cancel.cancel();
+        use std::sync::atomic::Ordering;
 
-        let timeout = tokio::time::Duration::from_secs(5);
+        // Phase 1: stop accepting new connections
+        self.accept_cancel.cancel();
+
+        // Phase 2: drain — wait for active connections to finish (max 3s)
+        let drain_deadline = tokio::time::Instant::now()
+            + tokio::time::Duration::from_secs(3);
+        loop {
+            let active: u64 = self.stats.iter().map(|(_, s)| {
+                s.active_tcp_connections.load(Ordering::Relaxed)
+                    + s.active_udp_sessions.load(Ordering::Relaxed)
+            }).sum();
+            if active == 0 { break; }
+            if tokio::time::Instant::now() >= drain_deadline { break; }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+
+        // Phase 3: force cancel remaining connections
+        self.force_cancel.cancel();
+
+        // Phase 4: collect results with 2s cleanup timeout
+        let timeout = tokio::time::Duration::from_secs(2);
         let mut results = Vec::new();
 
         for handle in self.join_handles {
@@ -84,7 +109,13 @@ pub async fn run_with_capture(
     config: CoreConfig,
     capture: std::sync::Arc<crate::capture::CaptureManager>,
 ) -> Result<EngineHandle, HarpoonError> {
-    let cancel = CancellationToken::new();
+    #[cfg(feature = "tls")]
+    {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
+    let accept_cancel = CancellationToken::new();
+    let force_cancel = CancellationToken::new();
     let (event_tx, _) = broadcast::channel(config.event_channel_capacity);
     let mut handles: Vec<JoinHandle<Result<(), HarpoonError>>> = Vec::new();
     let mut stats_vec = Vec::new();
@@ -96,6 +127,18 @@ pub async fn run_with_capture(
         .map(rule_to_pipeline)
         .collect();
     all_pipelines.extend(config.pipelines.clone());
+
+    // 1b. Validate unique pipeline names
+    {
+        let mut seen = std::collections::HashSet::new();
+        for p in &all_pipelines {
+            if !seen.insert(&p.name) {
+                return Err(HarpoonError::Config(format!(
+                    "duplicate pipeline name: '{}'", p.name
+                )));
+            }
+        }
+    }
 
     // 2. Compile each pipeline into an ExecutionPlan
     let mut plans = Vec::new();
@@ -121,7 +164,8 @@ pub async fn run_with_capture(
             plan,
             pipeline_stats,
             event_tx.clone(),
-            cancel.child_token(),
+            accept_cancel.child_token(),
+            force_cancel.clone(),
             config.buffer_size,
             config.udp_max_datagram,
             config.tcp_nodelay,
@@ -138,11 +182,12 @@ pub async fn run_with_capture(
     crate::capture::metrics::spawn_metrics_collector(
         metrics.clone(),
         stats_vec.clone(),
-        cancel.child_token(),
+        accept_cancel.child_token(),
     );
 
     Ok(EngineHandle {
-        cancel,
+        accept_cancel,
+        force_cancel,
         event_tx,
         stats: stats_vec,
         join_handles: handles,
