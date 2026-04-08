@@ -59,23 +59,51 @@ pub async fn http2_proxy(
     // (SETTINGS, WINDOW_UPDATE, PING) causing handshake timeouts
     let _ = client_stream.set_nodelay(true);
 
-    // Run server handshake and upstream TCP connect concurrently.
-    // server::handshake() reads client preface + SETTINGS and sends server SETTINGS.
-    // Doing both in parallel ensures the client gets SETTINGS ASAP.
-    let (h2_server_result, upstream_tcp_result) = tokio::join!(
-        server::handshake(client_stream),
-        TcpStream::connect(target_addr),
-    );
-
-    let mut h2_server = h2_server_result
+    // Server handshake: reads client preface + SETTINGS, queues server SETTINGS.
+    // IMPORTANT: server SETTINGS is NOT flushed to the socket here — it only
+    // gets written when the Connection is polled (via accept()).
+    let h2_server = server::handshake(client_stream)
+        .await
         .map_err(|e| HarpoonError::Config(format!("HTTP/2 server handshake failed: {e}")))?;
-    let upstream = upstream_tcp_result
-        .map_err(|e| HarpoonError::UpstreamConnect { addr: target_addr, source: e })?;
 
     tracing::debug!(rule = rule_name, "HTTP/2 server handshake complete");
 
-    // Upstream HTTP/2 handshake (sequential — server SETTINGS already sent to client)
+    // Immediately spawn the accept loop so the Connection is polled and server
+    // SETTINGS is flushed to the client. Without this, the client would time out
+    // waiting for SETTINGS during the upstream connect + handshake below.
+    let (stream_tx, mut stream_rx) = mpsc::channel::<(
+        http::Request<h2::RecvStream>,
+        h2::server::SendResponse<Bytes>,
+    )>(64);
+    let accept_cancel = cancel.child_token();
+    tokio::spawn(async move {
+        let mut h2_server = h2_server;
+        loop {
+            tokio::select! {
+                result = h2_server.accept() => {
+                    match result {
+                        Some(Ok(pair)) => {
+                            if stream_tx.send(pair).await.is_err() { break; }
+                        }
+                        Some(Err(e)) => {
+                            tracing::debug!(error = %e, "HTTP/2 accept stream error");
+                            break;
+                        }
+                        None => break,
+                    }
+                }
+                _ = accept_cancel.cancelled() => break,
+            }
+        }
+    });
+
+    // Upstream connect + H2 handshake. Server SETTINGS is being flushed
+    // concurrently by the accept task above.
+    let upstream = TcpStream::connect(target_addr)
+        .await
+        .map_err(|e| HarpoonError::UpstreamConnect { addr: target_addr, source: e })?;
     let _ = upstream.set_nodelay(true);
+
     let (h2_client, h2_conn) = client::handshake(upstream)
         .await
         .map_err(|e| HarpoonError::Config(format!("HTTP/2 client handshake failed: {e}")))?;
@@ -96,15 +124,8 @@ pub async fn http2_proxy(
     let mut h2_client = h2_client.ready().await
         .map_err(|e| HarpoonError::Config(format!("HTTP/2 client not ready: {e}")))?;
 
-    // Process streams from client
-    while let Some(result) = h2_server.accept().await {
-        let (request, mut respond) = match result {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::debug!(error = %e, "HTTP/2 accept stream error");
-                break;
-            }
-        };
+    // Process streams forwarded from the accept task
+    while let Some((request, mut respond)) = stream_rx.recv().await {
 
         let (head, mut body) = request.into_parts();
 

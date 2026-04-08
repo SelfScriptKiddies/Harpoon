@@ -38,6 +38,9 @@ pub async fn run_tcp_pipeline(
         EventKind::RuleActivated { rule: params.name.clone() },
     ).await;
 
+    let max_connections: usize = 10_000;
+    let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(max_connections));
+
     let target_addr = params.target_addr;
     let name = Arc::new(params.name);
     let dup_endpoint = params.duplicate_addr;
@@ -72,6 +75,15 @@ pub async fn run_tcp_pipeline(
                     rule: name.to_string(), client: client_addr,
                 }).await;
 
+                let permit = match conn_semaphore.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        tracing::warn!(pipeline = %name, "max connections reached, rejecting");
+                        drop(client_stream);
+                        continue;
+                    }
+                };
+
                 let stats = stats.clone();
                 let filters = filters.clone();
                 let event_tx = event_tx.clone();
@@ -84,6 +96,7 @@ pub async fn run_tcp_pipeline(
                 let ca = ca.clone();
 
                 tokio::spawn(async move {
+                    let _permit = permit;
                     let result = {
                         #[cfg(feature = "tls")]
                         {
@@ -242,10 +255,15 @@ async fn handle_tcp_connection(
         let cancel = cancel.clone();
 
         let mut c2s_buf = vec![0u8; buffer_size];
+        let idle_timeout = std::time::Duration::from_secs(300);
         async move {
             loop {
                 tokio::select! {
-                    result = client_read.read(&mut c2s_buf) => {
+                    result = tokio::time::timeout(idle_timeout, client_read.read(&mut c2s_buf)) => {
+                        let result = match result {
+                            Ok(r) => r,
+                            Err(_) => break, // idle timeout
+                        };
                         let n = result?;
                         if n == 0 { break; }
                         let data = &c2s_buf[..n];
@@ -307,10 +325,15 @@ async fn handle_tcp_connection(
         let cancel = cancel.clone();
 
         let mut s2c_buf = vec![0u8; buffer_size];
+        let idle_timeout = std::time::Duration::from_secs(300);
         async move {
             loop {
                 tokio::select! {
-                    result = upstream_read.read(&mut s2c_buf) => {
+                    result = tokio::time::timeout(idle_timeout, upstream_read.read(&mut s2c_buf)) => {
+                        let result = match result {
+                            Ok(r) => r,
+                            Err(_) => break, // idle timeout
+                        };
                         let n = result?;
                         if n == 0 { break; }
                         let data = &s2c_buf[..n];
@@ -375,11 +398,17 @@ async fn fast_path_proxy(
     stats: &RuleStats,
     cancel: &CancellationToken,
 ) -> Result<(), HarpoonError> {
+    let idle_timeout = std::time::Duration::from_secs(300);
     tokio::select! {
-        result = tokio::io::copy_bidirectional(&mut client, &mut upstream) => {
-            let (c2s, s2c) = result.map_err(HarpoonError::Io)?;
-            stats.bytes_client_to_server.fetch_add(c2s, Ordering::Relaxed);
-            stats.bytes_server_to_client.fetch_add(s2c, Ordering::Relaxed);
+        result = tokio::time::timeout(idle_timeout, tokio::io::copy_bidirectional(&mut client, &mut upstream)) => {
+            match result {
+                Ok(Ok((c2s, s2c))) => {
+                    stats.bytes_client_to_server.fetch_add(c2s, Ordering::Relaxed);
+                    stats.bytes_server_to_client.fetch_add(s2c, Ordering::Relaxed);
+                }
+                Ok(Err(e)) => return Err(HarpoonError::Io(e)),
+                Err(_) => {} // idle timeout
+            }
             Ok(())
         }
         _ = cancel.cancelled() => Ok(()),

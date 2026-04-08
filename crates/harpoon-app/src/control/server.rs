@@ -34,6 +34,11 @@ pub async fn run_control_server(
     let _ = std::fs::remove_file(socket_path);
 
     let listener = UnixListener::bind(socket_path)?;
+
+    // Restrict socket permissions to owner-only
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))?;
+
     tracing::info!(path = %socket_path.display(), "control socket listening");
 
     // Spawn event collector

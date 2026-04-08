@@ -12,7 +12,14 @@ impl CompiledFilter {
         #[cfg(feature = "regex-filter")]
         let compiled_regex = match &filter.kind {
             FilterKind::Regex(pattern) => {
-                let re = regex::bytes::Regex::new(pattern)
+                if pattern.len() > 1024 {
+                    return Err(HarpoonError::Filter(
+                        "regex pattern too long (max 1024 bytes)".into(),
+                    ));
+                }
+                let re = regex::bytes::RegexBuilder::new(pattern)
+                    .size_limit(1 << 20) // 1 MB compiled size limit
+                    .build()
                     .map_err(|e| HarpoonError::Filter(format!("invalid regex: {e}")))?;
                 Some(re)
             }

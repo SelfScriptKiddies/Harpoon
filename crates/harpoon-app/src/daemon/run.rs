@@ -93,7 +93,8 @@ async fn run_engine_loop(config_path: PathBuf, socket_path: &std::path::Path) ->
             .with_context(|| format!("invalid web_bind address: {web_bind}"))?;
         let web_password = _web_password.unwrap_or_else(|| {
             let generated = gen_password();
-            tracing::info!("Web UI credentials — login: admin, password: {generated}");
+            tracing::info!("Web UI started — login: admin (password printed to stderr)");
+            eprintln!("Harpoon Web UI password: {generated}");
             generated
         });
         let web_state = control_state.clone();
@@ -313,13 +314,10 @@ fn apply_nft_config(app_config: &AppConfig) -> Result<(bool, Option<u32>)> {
 
 #[cfg(feature = "web")]
 fn gen_password() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let seed = ts ^ (std::process::id() as u128) ^ 0xDEAD_BEEF;
-    format!("{:016x}", seed)
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let bytes: [u8; 16] = rng.gen();
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 fn daemonize(pid_file: &std::path::Path) -> Result<()> {
