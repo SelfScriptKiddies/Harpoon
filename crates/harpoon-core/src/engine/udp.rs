@@ -205,6 +205,13 @@ async fn run_udp_inner(
                     FilterAction::Pass => {}
                 }
 
+                const MAX_UDP_SESSIONS: usize = 50_000;
+                if sessions.len() >= MAX_UDP_SESSIONS {
+                    tracing::warn!(rule = %rule_name, "max UDP sessions reached, dropping packet");
+                    stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+
                 if !sessions.contains_key(&key) {
                     // Create new session
                     let upstream_socket = match create_session_socket(

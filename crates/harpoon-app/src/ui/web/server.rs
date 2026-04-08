@@ -1,12 +1,14 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use axum::extract::{Path as AxumPath, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path as AxumPath, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use include_dir::{include_dir, Dir};
+use subtle::ConstantTimeEq;
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
@@ -19,9 +21,10 @@ static STATIC_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/src/ui/web/static");
 pub struct WebState {
     pub control: Arc<RwLock<ControlState>>,
     pub password: String,
-    pub tokens: Mutex<HashSet<String>>,
+    pub tokens: Mutex<HashMap<String, Instant>>,
     pub capture: Arc<harpoon_core::capture::CaptureManager>,
     pub metrics: Arc<harpoon_core::capture::metrics::MetricsCollector>,
+    pub login_attempts: Mutex<HashMap<std::net::IpAddr, (u32, Instant)>>,
 }
 
 pub async fn run_web_server(
@@ -35,9 +38,10 @@ pub async fn run_web_server(
     let state = Arc::new(WebState {
         control,
         password,
-        tokens: Mutex::new(HashSet::new()),
+        tokens: Mutex::new(HashMap::new()),
         capture,
         metrics,
+        login_attempts: Mutex::new(HashMap::new()),
     });
 
     let app = Router::new()
@@ -75,19 +79,35 @@ pub async fn run_web_server(
         // Static files
         .route("/", get(index_page))
         .route("/{*path}", get(static_file))
-        .layer(CorsLayer::permissive())
+        .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MB
+        .layer(axum::middleware::from_fn(security_headers))
+        .layer(CorsLayer::new()
+            .allow_origin(tower_http::cors::Any)
+            .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
+            .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     tracing::info!(%bind_addr, "web UI listening");
 
-    axum::serve(listener, app)
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
         .with_graceful_shutdown(async move {
             cancel.cancelled().await;
         })
         .await?;
 
     Ok(())
+}
+
+async fn security_headers(
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    let mut resp = next.run(req).await;
+    let h = resp.headers_mut();
+    h.insert("X-Content-Type-Options", HeaderValue::from_static("nosniff"));
+    h.insert("X-Frame-Options", HeaderValue::from_static("DENY"));
+    resp
 }
 
 // --- Static file serving ---
@@ -127,22 +147,34 @@ fn serve_static(path: &str) -> Response {
 
 // --- Auth ---
 
-fn check_auth(headers: &HeaderMap, tokens: &HashSet<String>) -> bool {
-    headers
+const TOKEN_TTL: Duration = Duration::from_secs(3600);
+const MAX_LOGIN_ATTEMPTS: u32 = 10;
+const LOGIN_LOCKOUT: Duration = Duration::from_secs(300);
+
+async fn check_auth(headers: &HeaderMap, tokens: &Mutex<HashMap<String, Instant>>) -> bool {
+    let token = match headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .map(|t| tokens.contains(t))
-        .unwrap_or(false)
+    {
+        Some(t) => t.to_string(),
+        None => return false,
+    };
+    let mut map = tokens.lock().await;
+    if let Some(created) = map.get(&token) {
+        if created.elapsed() < TOKEN_TTL {
+            return true;
+        }
+        map.remove(&token);
+    }
+    false
 }
 
 fn gen_token() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("{:x}{:x}", ts, std::process::id())
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let bytes: [u8; 32] = rng.gen();
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 #[derive(serde::Deserialize)]
@@ -158,21 +190,43 @@ struct LoginResp {
 
 async fn api_login(
     State(state): State<Arc<WebState>>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<LoginReq>,
 ) -> Result<Json<LoginResp>, StatusCode> {
-    if req.username == "admin" && req.password == state.password {
+    // Rate limiting
+    {
+        let mut attempts = state.login_attempts.lock().await;
+        if let Some((count, since)) = attempts.get(&addr.ip()) {
+            if since.elapsed() >= LOGIN_LOCKOUT {
+                attempts.remove(&addr.ip());
+            } else if *count >= MAX_LOGIN_ATTEMPTS {
+                return Err(StatusCode::TOO_MANY_REQUESTS);
+            }
+        }
+    }
+
+    let password_match = req.username == "admin"
+        && bool::from(req.password.as_bytes().ct_eq(state.password.as_bytes()));
+
+    if password_match {
+        state.login_attempts.lock().await.remove(&addr.ip());
         let token = gen_token();
-        state.tokens.lock().await.insert(token.clone());
+        state.tokens.lock().await.insert(token.clone(), Instant::now());
         Ok(Json(LoginResp { token }))
     } else {
+        let mut attempts = state.login_attempts.lock().await;
+        let entry = attempts.entry(addr.ip()).or_insert((0, Instant::now()));
+        entry.0 += 1;
+        if entry.0 == 1 {
+            entry.1 = Instant::now();
+        }
         Err(StatusCode::UNAUTHORIZED)
     }
 }
 
 macro_rules! require_auth {
     ($state:expr, $headers:expr) => {{
-        let tokens = $state.tokens.lock().await;
-        if !check_auth(&$headers, &tokens) {
+        if !check_auth(&$headers, &$state.tokens).await {
             return Err(StatusCode::UNAUTHORIZED);
         }
     }};
@@ -190,7 +244,9 @@ async fn api_status(
         running: s.engine_handle.is_some(),
         uptime_secs: s.start_time.elapsed().as_secs(),
         rules_count: s.rules_info.len(),
-        config_path: s.config_path.display().to_string(),
+        config_path: s.config_path.file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".into()),
     }))
 }
 
@@ -300,7 +356,10 @@ async fn api_nft_apply(
             let ruleset = crate::nft::render::render_install(&nft_rules);
             match crate::nft::apply::apply_with_rollback(&ruleset) {
                 Ok(_) => Ok(Json(serde_json::json!({ "ok": true }))),
-                Err(e) => Ok(Json(serde_json::json!({ "ok": false, "error": e.to_string() }))),
+                Err(e) => {
+                    tracing::error!(error = %e, "nft apply failed");
+                    Ok(Json(serde_json::json!({ "ok": false, "error": "nft apply failed" })))
+                }
             }
         }
         _ => Ok(Json(serde_json::json!({ "ok": false, "error": "nft not enabled" }))),
@@ -314,7 +373,10 @@ async fn api_nft_rollback(
     require_auth!(state, headers);
     match crate::nft::apply::cleanup_table() {
         Ok(_) => Ok(Json(serde_json::json!({ "ok": true }))),
-        Err(e) => Ok(Json(serde_json::json!({ "ok": false, "error": e.to_string() }))),
+        Err(e) => {
+            tracing::error!(error = %e, "nft rollback failed");
+            Ok(Json(serde_json::json!({ "ok": false, "error": "nft rollback failed" })))
+        }
     }
 }
 
@@ -410,7 +472,12 @@ async fn api_rule_update(
         let idx = rules
             .iter()
             .position(|r| r.name == req.original_name)
-            .ok_or_else(|| format!("rule '{}' not found", req.original_name))?;
+            .ok_or("rule not found".to_string())?;
+        if req.rule.name != req.original_name
+            && rules.iter().any(|r| r.name == req.rule.name)
+        {
+            return Err("target rule name already exists".into());
+        }
         rules[idx] = req.rule;
         Ok(())
     })
@@ -457,17 +524,20 @@ where
     }
 
     if let Err(e) = crate::convert::convert(app_config.clone()) {
-        return Ok(Json(serde_json::json!({"ok": false, "error": format!("validation: {e}")})));
+        tracing::warn!(error = %e, "rule validation failed");
+        return Ok(Json(serde_json::json!({"ok": false, "error": "validation failed"})));
     }
 
     if let Err(e) = crate::config::load::save_config(&config_path, &app_config) {
-        return Ok(Json(serde_json::json!({"ok": false, "error": format!("save: {e}")})));
+        tracing::error!(error = %e, "config save failed");
+        return Ok(Json(serde_json::json!({"ok": false, "error": "failed to save config"})));
     }
 
     if let Err(e) =
         crate::daemon::run::apply_app_config(&state.control, app_config, &config_path).await
     {
-        return Ok(Json(serde_json::json!({"ok": false, "error": format!("apply: {e}")})));
+        tracing::error!(error = %e, "config apply failed");
+        return Ok(Json(serde_json::json!({"ok": false, "error": "failed to apply config"})));
     }
 
     Ok(Json(serde_json::json!({"ok": true})))
@@ -643,15 +713,18 @@ where
     }
 
     if let Err(e) = crate::convert::convert(app_config.clone()) {
-        return Ok(Json(serde_json::json!({"ok": false, "error": format!("validation: {e}")})));
+        tracing::warn!(error = %e, "pipeline validation failed");
+        return Ok(Json(serde_json::json!({"ok": false, "error": "validation failed"})));
     }
 
     if let Err(e) = crate::config::load::save_config(&config_path, &app_config) {
-        return Ok(Json(serde_json::json!({"ok": false, "error": format!("save: {e}")})));
+        tracing::error!(error = %e, "config save failed");
+        return Ok(Json(serde_json::json!({"ok": false, "error": "failed to save config"})));
     }
 
     if let Err(e) = crate::daemon::run::apply_app_config(&state.control, app_config, &config_path).await {
-        return Ok(Json(serde_json::json!({"ok": false, "error": format!("apply: {e}")})));
+        tracing::error!(error = %e, "config apply failed");
+        return Ok(Json(serde_json::json!({"ok": false, "error": "failed to apply config"})));
     }
 
     Ok(Json(serde_json::json!({"ok": true})))
@@ -721,7 +794,10 @@ async fn api_capture_start(
     Json(req): Json<CaptureStartReq>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     require_auth!(state, headers);
-    match state.capture.start(req.rule, req.max_packets, req.max_payload_size, req.timeout_secs) {
+    let max_packets = req.max_packets.min(100_000);
+    let max_payload_size = req.max_payload_size.min(1_048_576);
+    let timeout_secs = req.timeout_secs.min(86_400);
+    match state.capture.start(req.rule, max_packets, max_payload_size, timeout_secs) {
         Ok(()) => Ok(Json(serde_json::json!({"ok": true}))),
         Err(e) => Ok(Json(serde_json::json!({"ok": false, "error": e}))),
     }
@@ -796,10 +872,14 @@ async fn api_capture_sessions(
 
 async fn api_capture_ws(
     State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
     ws: axum::extract::WebSocketUpgrade,
-) -> impl IntoResponse {
+) -> Result<Response, StatusCode> {
+    if !check_auth(&headers, &state.tokens).await {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
     let capture = state.capture.clone();
-    ws.on_upgrade(move |mut socket| async move {
+    Ok(ws.on_upgrade(move |mut socket| async move {
         let mut rx = capture.subscribe();
         loop {
             match rx.recv().await {
@@ -822,7 +902,7 @@ async fn api_capture_ws(
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
-    })
+    }))
 }
 
 fn hex_encode(data: &[u8]) -> String {

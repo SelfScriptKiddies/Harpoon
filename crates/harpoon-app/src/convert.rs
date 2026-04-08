@@ -76,6 +76,16 @@ impl PortPolicy {
     }
 }
 
+fn validate_path_no_traversal(path: &str, context: &str) -> Result<PathBuf> {
+    let p = std::path::Path::new(path);
+    for component in p.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            bail!("{context}: path must not contain '..'");
+        }
+    }
+    Ok(PathBuf::from(path))
+}
+
 pub fn convert(app: AppConfig) -> Result<CoreConfig> {
     let port_policy = PortPolicy::parse(app.global.allowed_ports.as_deref())?;
 
@@ -241,7 +251,7 @@ fn convert_rule(r: AppRule) -> Result<Rule> {
                         .as_ref()
                         .with_context(|| format!("uds exporter requires 'path' in rule '{}'", r.name))?;
                     ExporterKind::Uds {
-                        path: PathBuf::from(path),
+                        path: validate_path_no_traversal(path, &format!("uds exporter in rule '{}'", r.name))?,
                     }
                 }
                 "tcp" | "tcp_framed" => {
@@ -271,8 +281,8 @@ fn convert_rule(r: AppRule) -> Result<Rule> {
             };
             Some(TlsConfig {
                 mode,
-                ca_cert_path: PathBuf::from(&tls_cfg.ca_cert),
-                ca_key_path: PathBuf::from(&tls_cfg.ca_key),
+                ca_cert_path: validate_path_no_traversal(&tls_cfg.ca_cert, &format!("tls ca_cert in rule '{}'", r.name))?,
+                ca_key_path: validate_path_no_traversal(&tls_cfg.ca_key, &format!("tls ca_key in rule '{}'", r.name))?,
             })
         }
         None => None,
@@ -380,8 +390,8 @@ fn convert_pipeline_node(n: &crate::config::schema::AppPipelineNode) -> Result<p
             let cert = c.get("ca_cert").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let key = c.get("ca_key").and_then(|v| v.as_str()).unwrap_or("").to_string();
             Ok(pipe::NodeKind::TlsTerminate(pipe::TlsTerminateConfig {
-                ca_cert_path: PathBuf::from(cert),
-                ca_key_path: PathBuf::from(key),
+                ca_cert_path: validate_path_no_traversal(&cert, "tls_terminate ca_cert")?,
+                ca_key_path: validate_path_no_traversal(&key, "tls_terminate ca_key")?,
             }))
         }
         "tls_initiate" => {
@@ -430,7 +440,7 @@ fn convert_pipeline_node(n: &crate::config::schema::AppPipelineNode) -> Result<p
             let ek = match exp_kind {
                 "uds" | "unix" => {
                     let path = c.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    ExporterKind::Uds { path: PathBuf::from(path) }
+                    ExporterKind::Uds { path: validate_path_no_traversal(&path, "export node path")? }
                 }
                 _ => {
                     let addr: SocketAddr = c.get("addr").and_then(|v| v.as_str()).unwrap_or("127.0.0.1:4000")

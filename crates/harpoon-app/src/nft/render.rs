@@ -163,7 +163,10 @@ fn render_rule(rule: &NftRule) -> String {
     let comment = rule
         .comment
         .as_ref()
-        .map(|c| format!(" comment \"{c}\""))
+        .map(|c| {
+            let sanitized = c.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', " ").replace('\r', "");
+            format!(" comment \"{sanitized}\"")
+        })
         .unwrap_or_default();
 
     let action = match &rule.action {
