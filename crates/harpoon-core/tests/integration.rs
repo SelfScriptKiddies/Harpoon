@@ -657,3 +657,334 @@ async fn test_http2_proxy_basic() {
     handle.stop();
     handle.shutdown().await;
 }
+
+// ── HTTP/2 large-body regression tests ──
+//
+// The h2 server-side Connection is the only driver of client socket reads and
+// flow-control WINDOW_UPDATEs. These tests push 200KB bodies (far beyond the
+// ~64KB initial HTTP/2 flow-control window) in both directions; they deadlock
+// if the proxy stops driving the Connection while streaming a body.
+
+/// 200KB request body roundtrip: client → proxy → upstream, upstream reads the
+/// FULL body then echoes its length. Deadlocks if the server-side Connection
+/// isn't driven while the proxy streams the request body (client exhausts its
+/// flow-control window and the response HEADERS never arrive).
+#[cfg(feature = "http2")]
+#[tokio::test]
+async fn test_http2_proxy_large_request_body() {
+    const BODY: usize = 200 * 1024;
+
+    // Upstream H2 server: per-stream handlers are spawned (like hyper does),
+    // so the upstream connection driver never blocks on a stream.
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let (stream, _) = upstream_listener.accept().await.unwrap();
+        let mut conn = h2::server::handshake(stream).await.expect("upstream h2 handshake");
+        while let Some(result) = conn.accept().await {
+            let (req, mut respond) = result.expect("upstream accept");
+            tokio::spawn(async move {
+                // Read FULL request body, then respond with its length
+                let mut total = 0usize;
+                let mut body = req.into_body();
+                while let Some(chunk) = body.data().await {
+                    let chunk = chunk.expect("upstream request chunk");
+                    let _ = body.flow_control().release_capacity(chunk.len());
+                    total += chunk.len();
+                }
+                let response = http::Response::builder().status(200).body(()).unwrap();
+                let mut send = respond.send_response(response, false).unwrap();
+                send.send_data(Bytes::from(format!("len: {total}")), true).unwrap();
+            });
+        }
+    });
+
+    let tmp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = tmp.local_addr().unwrap();
+    drop(tmp);
+
+    let config = CoreConfig {
+        rules: vec![Rule {
+            name: "h2-big-req".into(),
+            listen: Endpoint::tcp(proxy_addr),
+            target: Endpoint::tcp(upstream_addr),
+            filters: vec![],
+            duplicate: None,
+            exporter: None,
+            tls: None,
+            udp_source_mode: harpoon_core::types::rule::UdpSourceMode::Proxy,
+            http2: true,
+            idle_timeout_secs: 30,
+        }],
+        ..CoreConfig::default()
+    };
+
+    let handle = harpoon_core::run(config).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // H2 client: send a 200KB request body in 16KB chunks (realistic framing)
+    let tcp = TcpStream::connect(proxy_addr).await.unwrap();
+    let (mut h2_client, h2_conn) = tokio::time::timeout(
+        Duration::from_secs(5),
+        h2::client::handshake(tcp),
+    )
+    .await
+    .expect("H2 client handshake timed out")
+    .expect("H2 client handshake failed");
+
+    tokio::spawn(async move {
+        let _ = h2_conn.await;
+    });
+
+    let mut h2_client = h2_client.ready().await.unwrap();
+
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("http://localhost/big-request")
+        .body(())
+        .unwrap();
+
+    let (response_future, mut send_stream) = h2_client.send_request(request, false).unwrap();
+
+    let payload = vec![b'x'; BODY];
+    for chunk in payload.chunks(16 * 1024) {
+        send_stream.send_data(Bytes::copy_from_slice(chunk), false).unwrap();
+    }
+    send_stream.send_data(Bytes::new(), true).unwrap();
+
+    let response = tokio::time::timeout(Duration::from_secs(10), response_future)
+        .await
+        .expect("response HEADERS timed out: request body deadlocked on flow control")
+        .expect("response error");
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+
+    let mut body = response.into_body();
+    let mut response_data = Vec::new();
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk.unwrap();
+        body.flow_control().release_capacity(chunk.len()).unwrap();
+        response_data.extend_from_slice(&chunk);
+    }
+
+    assert_eq!(String::from_utf8(response_data).unwrap(), format!("len: {BODY}"));
+
+    handle.stop();
+    handle.shutdown().await;
+}
+
+/// 200KB response body roundtrip: upstream sends the response FIRST, then
+/// drains the request. Asserts the client receives all 204800 body bytes.
+#[cfg(feature = "http2")]
+#[tokio::test]
+async fn test_http2_proxy_large_response_body() {
+    const BODY: usize = 200 * 1024;
+
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let (stream, _) = upstream_listener.accept().await.unwrap();
+        let mut conn = h2::server::handshake(stream).await.expect("upstream h2 handshake");
+        while let Some(result) = conn.accept().await {
+            let (req, mut respond) = result.expect("upstream accept");
+            tokio::spawn(async move {
+                // Send the 200KB response first, then drain the request body
+                let response = http::Response::builder().status(200).body(()).unwrap();
+                let mut send = respond.send_response(response, false).unwrap();
+                let payload = vec![b'y'; BODY];
+                for chunk in payload.chunks(16 * 1024) {
+                    send.send_data(Bytes::copy_from_slice(chunk), false).unwrap();
+                }
+                send.send_data(Bytes::new(), true).unwrap();
+
+                let mut body = req.into_body();
+                while let Some(chunk) = body.data().await {
+                    let chunk = chunk.expect("upstream request chunk");
+                    let _ = body.flow_control().release_capacity(chunk.len());
+                }
+            });
+        }
+    });
+
+    let tmp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = tmp.local_addr().unwrap();
+    drop(tmp);
+
+    let config = CoreConfig {
+        rules: vec![Rule {
+            name: "h2-big-resp".into(),
+            listen: Endpoint::tcp(proxy_addr),
+            target: Endpoint::tcp(upstream_addr),
+            filters: vec![],
+            duplicate: None,
+            exporter: None,
+            tls: None,
+            udp_source_mode: harpoon_core::types::rule::UdpSourceMode::Proxy,
+            http2: true,
+            idle_timeout_secs: 30,
+        }],
+        ..CoreConfig::default()
+    };
+
+    let handle = harpoon_core::run(config).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let tcp = TcpStream::connect(proxy_addr).await.unwrap();
+    let (mut h2_client, h2_conn) = tokio::time::timeout(
+        Duration::from_secs(5),
+        h2::client::handshake(tcp),
+    )
+    .await
+    .expect("H2 client handshake timed out")
+    .expect("H2 client handshake failed");
+
+    tokio::spawn(async move {
+        let _ = h2_conn.await;
+    });
+
+    let mut h2_client = h2_client.ready().await.unwrap();
+
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("http://localhost/big-response")
+        .body(())
+        .unwrap();
+
+    let (response_future, mut send_stream) = h2_client.send_request(request, false).unwrap();
+
+    let payload = vec![b'x'; BODY];
+    for chunk in payload.chunks(16 * 1024) {
+        send_stream.send_data(Bytes::copy_from_slice(chunk), false).unwrap();
+    }
+    send_stream.send_data(Bytes::new(), true).unwrap();
+
+    let response = tokio::time::timeout(Duration::from_secs(10), response_future)
+        .await
+        .expect("response HEADERS timed out")
+        .expect("response error");
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+
+    // Read the full 200KB response body
+    let mut body = response.into_body();
+    let mut total = 0usize;
+    let read_all = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.expect("client response chunk");
+            if !chunk.is_empty() {
+                assert_eq!(chunk[0], b'y');
+            }
+            body.flow_control().release_capacity(chunk.len()).unwrap();
+            total += chunk.len();
+        }
+    })
+    .await;
+    assert!(read_all.is_ok(), "response body read timed out at {total} bytes");
+    assert_eq!(total, BODY, "client must receive all {BODY} response body bytes");
+
+    handle.stop();
+    handle.shutdown().await;
+}
+
+/// Upstream responds immediately from headers and NEVER reads the request
+/// body. The client (still sending its 200KB body) must still receive the
+/// response — exercises the stream-reset / release flow-control paths when
+/// the proxy's body-forward loop is interrupted mid-stream.
+#[cfg(feature = "http2")]
+#[tokio::test]
+async fn test_http2_proxy_upstream_never_reads_body() {
+    const BODY: usize = 200 * 1024;
+
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let (stream, _) = upstream_listener.accept().await.unwrap();
+        let mut conn = h2::server::handshake(stream).await.expect("upstream h2 handshake");
+        while let Some(result) = conn.accept().await {
+            let (req, mut respond) = result.expect("upstream accept");
+            tokio::spawn(async move {
+                // Respond without ever reading the request body; `req` is
+                // dropped (resetting the stream) when this task ends
+                let response = http::Response::builder().status(200).body(()).unwrap();
+                let mut send = respond.send_response(response, false).unwrap();
+                send.send_data(Bytes::from_static(b"ok-no-read"), true).unwrap();
+                drop(req);
+            });
+        }
+    });
+
+    let tmp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = tmp.local_addr().unwrap();
+    drop(tmp);
+
+    let config = CoreConfig {
+        rules: vec![Rule {
+            name: "h2-no-read".into(),
+            listen: Endpoint::tcp(proxy_addr),
+            target: Endpoint::tcp(upstream_addr),
+            filters: vec![],
+            duplicate: None,
+            exporter: None,
+            tls: None,
+            udp_source_mode: harpoon_core::types::rule::UdpSourceMode::Proxy,
+            http2: true,
+            idle_timeout_secs: 30,
+        }],
+        ..CoreConfig::default()
+    };
+
+    let handle = harpoon_core::run(config).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let tcp = TcpStream::connect(proxy_addr).await.unwrap();
+    let (mut h2_client, h2_conn) = tokio::time::timeout(
+        Duration::from_secs(5),
+        h2::client::handshake(tcp),
+    )
+    .await
+    .expect("H2 client handshake timed out")
+    .expect("H2 client handshake failed");
+
+    tokio::spawn(async move {
+        let _ = h2_conn.await;
+    });
+
+    let mut h2_client = h2_client.ready().await.unwrap();
+
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("http://localhost/never-read")
+        .body(())
+        .unwrap();
+
+    let (response_future, mut send_stream) = h2_client.send_request(request, false).unwrap();
+
+    let payload = vec![b'x'; BODY];
+    for chunk in payload.chunks(16 * 1024) {
+        send_stream.send_data(Bytes::copy_from_slice(chunk), false).unwrap();
+    }
+    send_stream.send_data(Bytes::new(), true).unwrap();
+
+    let response = tokio::time::timeout(Duration::from_secs(10), response_future)
+        .await
+        .expect("response timed out: upstream reset should abort body forwarding, not hang")
+        .expect("response error");
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+
+    let mut body = response.into_body();
+    let mut response_data = Vec::new();
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk.unwrap();
+        body.flow_control().release_capacity(chunk.len()).unwrap();
+        response_data.extend_from_slice(&chunk);
+    }
+
+    assert_eq!(String::from_utf8(response_data).unwrap(), "ok-no-read");
+
+    handle.stop();
+    handle.shutdown().await;
+}

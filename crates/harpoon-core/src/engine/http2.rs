@@ -79,15 +79,62 @@ pub async fn http2_proxy(
 ) -> Result<(), HarpoonError> {
     let _ = client_stream.set_nodelay(true);
 
-    // Server handshake: h2 flushes server SETTINGS first, then reads client
-    // preface. By the time this returns, the client has our SETTINGS.
+    // Server handshake: in h2 0.4, `server::handshake()` flushes our server
+    // SETTINGS before returning (its state machine runs Flushing → ReadingPreface),
+    // so by the time this returns the client already has our SETTINGS — verified
+    // by `test_http2_settings_arrives_raw`.
     tracing::debug!(rule = rule_name, client = %client_addr, "HTTP/2 server handshake starting");
-    let mut h2_server = server::handshake(client_stream)
+    let h2_server = server::handshake(client_stream)
         .await
         .map_err(|e| HarpoonError::Config(format!("HTTP/2 server handshake failed: {e}")))?;
     tracing::debug!(rule = rule_name, "HTTP/2 server handshake complete, SETTINGS sent");
 
-    // Connect to upstream and do H2 client handshake
+    // Connection-driver accept loop — REQUIRED, do not remove.
+    //
+    // The real reason this task must exist (and why merely calling
+    // `h2_server.accept()` inline in the main loop below deadlocks): the h2
+    // server-side `Connection` is the ONLY thing that reads the client socket
+    // and emits flow-control WINDOW_UPDATEs for the connection's lifetime.
+    // `RecvStream::data()` / `flow_control()` only poll that stream's buffered
+    // frames — they do NOT drive socket I/O. If the Connection is polled only
+    // between streams, then while the main loop sits in a request-body
+    // `body.data().await` loop, no socket reads and no WINDOW_UPDATEs happen:
+    // the client stalls once it exhausts the ~64KB initial flow-control window
+    // and request bodies beyond the accept-time buffer (~48KB+) deadlock.
+    // This task continuously polls `accept()` — driving reads + window updates
+    // concurrently with body streaming — and forwards (Request, SendResponse)
+    // pairs to the main loop over the channel.
+    let (stream_tx, mut stream_rx) = mpsc::channel::<(
+        http::Request<h2::RecvStream>,
+        h2::server::SendResponse<Bytes>,
+    )>(64);
+    let accept_cancel = cancel.child_token();
+    tokio::spawn(async move {
+        let mut h2_server = h2_server;
+        loop {
+            tokio::select! {
+                result = h2_server.accept() => {
+                    match result {
+                        Some(Ok(pair)) => {
+                            if stream_tx.send(pair).await.is_err() { break; }
+                        }
+                        Some(Err(e)) => {
+                            tracing::debug!(error = %e, "HTTP/2 accept stream error");
+                            break;
+                        }
+                        None => break,
+                    }
+                }
+                _ = accept_cancel.cancelled() => break,
+            }
+        }
+    });
+
+    // Connect to upstream and do H2 client handshake. Doing this sequentially
+    // after the server handshake is fine for h2 0.4: our SETTINGS was already
+    // flushed inside `server::handshake()` above, so the client is not blocked
+    // waiting for it while we connect. The accept task meanwhile keeps driving
+    // the server Connection in the background.
     tracing::debug!(rule = rule_name, target = %target_addr, "connecting to upstream");
     let upstream = TcpStream::connect(target_addr)
         .await
@@ -116,15 +163,10 @@ pub async fn http2_proxy(
     let mut h2_client = h2_client.ready().await
         .map_err(|e| HarpoonError::Config(format!("HTTP/2 client not ready: {e}")))?;
 
-    // Accept and process streams from client
-    while let Some(result) = h2_server.accept().await {
-        let (request, mut respond) = match result {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::debug!(error = %e, "HTTP/2 accept stream error");
-                break;
-            }
-        };
+    // Process streams forwarded from the accept task. The task above keeps
+    // the server-side Connection driven (socket reads + WINDOW_UPDATEs) while
+    // we stream bodies below.
+    while let Some((request, mut respond)) = stream_rx.recv().await {
 
         let (head, mut body) = request.into_parts();
 
