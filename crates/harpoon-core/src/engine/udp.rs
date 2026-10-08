@@ -9,7 +9,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::engine::executor::UdpParams;
-use crate::engine::filter::{apply_filters, CompiledFilter};
+use crate::engine::filter::{apply_filters, CompiledFilter, FilterView};
 use crate::error::HarpoonError;
 use crate::types::event::{Event, EventKind};
 use crate::types::filter::{Direction, FilterAction};
@@ -41,7 +41,8 @@ pub async fn run_udp_pipeline(
         params.udp_source_mode, params.idle_timeout_secs,
         params.max_datagram, params.capture, stats, event_tx, export_tx,
         cancel, params.force_cancel,
-    ).await
+    )
+    .await
 }
 
 /// Backward-compat wrapper.
@@ -57,7 +58,7 @@ pub async fn run_udp_rule(
     let force = cancel.child_token();
     run_udp_inner(
         rule.name.clone(), rule.listen.addr, rule.target.addr,
-        filters, rule.duplicate.as_ref().map(|d| d.endpoint.addr),
+        FilterView::Static(filters), rule.duplicate.as_ref().map(|d| d.endpoint.addr),
         rule.udp_source_mode.clone(), rule.idle_timeout_secs,
         max_datagram, crate::capture::CaptureManager::new(),
         stats, event_tx, export_tx, cancel, force,
@@ -69,7 +70,7 @@ async fn run_udp_inner(
     name: String,
     listen_addr: SocketAddr,
     target_addr: SocketAddr,
-    filters: Arc<Vec<CompiledFilter>>,
+    filters: FilterView,
     dup_endpoint: Option<SocketAddr>,
     source_mode: UdpSourceMode,
     idle_timeout_secs: u64,
@@ -179,8 +180,11 @@ async fn run_udp_inner(
                 let data = &buf[..n];
                 let key = SessionKey { client_addr };
 
-                // Apply client->server filters
-                let (action, filter_idx) = apply_filters(&filters, data, &Direction::ClientToServer);
+                // Apply client->server filters. Snapshot the current set per
+                // datagram: a hot-swap of a SharedFilterSet takes effect from
+                // this datagram on, atomically (old or new set, never a mix).
+                let current = filters.current();
+                let (action, filter_idx) = apply_filters(&current, data, &Direction::ClientToServer);
                 if let Some(idx) = filter_idx {
                     stats.filter_matches.fetch_add(1, Ordering::Relaxed);
                     let kind = if action == FilterAction::Drop {
@@ -253,7 +257,11 @@ async fn run_udp_inner(
 
                                     let data = &recv_buf[..n];
 
-                                    let (action, filter_idx) = apply_filters(&recv_filters, data, &Direction::ServerToClient);
+                                    // Per-datagram snapshot — a hot-swapped
+                                    // SharedFilterSet applies to this session's
+                                    // downstream traffic immediately.
+                                    let current = recv_filters.current();
+                                    let (action, filter_idx) = apply_filters(&current, data, &Direction::ServerToClient);
                                     if let Some(idx) = filter_idx {
                                         recv_stats.filter_matches.fetch_add(1, Ordering::Relaxed);
                                         let kind = if action == FilterAction::Drop {

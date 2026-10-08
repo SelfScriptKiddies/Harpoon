@@ -7,7 +7,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::engine::executor::TcpParams;
-use crate::engine::filter::{apply_filters, CompiledFilter};
+use crate::engine::filter::{apply_filters, CompiledFilter, FilterView};
 use crate::error::HarpoonError;
 use crate::types::event::{Event, EventKind};
 use crate::types::filter::{Direction, FilterAction};
@@ -172,7 +172,7 @@ pub async fn run_tcp_rule(
         name: rule.name.clone(),
         listen_addr: rule.listen.addr,
         target_addr: rule.target.addr,
-        filters,
+        filters: FilterView::Static(filters),
         duplicate_addr: rule.duplicate.as_ref().map(|d| d.endpoint.addr),
         buffer_size,
         tcp_nodelay,
@@ -194,7 +194,7 @@ async fn handle_tcp_connection(
     client_addr: std::net::SocketAddr,
     target_addr: std::net::SocketAddr,
     dup_endpoint: Option<std::net::SocketAddr>,
-    filters: &[CompiledFilter],
+    filters: &FilterView,
     stats: &RuleStats,
     event_tx: &broadcast::Sender<Event>,
     export_tx: &Option<mpsc::Sender<Event>>,
@@ -226,8 +226,10 @@ async fn handle_tcp_connection(
 
     let _ = upstream.set_nodelay(tcp_nodelay);
 
-    // Fast path: no filters, no duplicate — use zero-copy bidirectional copy
-    if filters.is_empty() && dup_endpoint.is_none() {
+    // Fast path: statically-empty filters, no duplicate — zero-copy bidirectional copy.
+    // A Shared (hot-swappable) set never qualifies: it may become non-empty
+    // later, and a connection on the fast path can never be filtered again.
+    if filters.is_static_empty() && dup_endpoint.is_none() {
         return fast_path_proxy(client_stream, upstream, stats, cancel).await;
     }
 
@@ -253,6 +255,7 @@ async fn handle_tcp_connection(
         let event_tx = event_tx.clone();
         let export_tx = export_tx.clone();
         let cancel = cancel.clone();
+        let filters = filters.clone();
 
         let mut c2s_buf = vec![0u8; buffer_size];
         let idle_timeout = std::time::Duration::from_secs(300);
@@ -268,7 +271,11 @@ async fn handle_tcp_connection(
                         if n == 0 { break; }
                         let data = &c2s_buf[..n];
 
-                        let (action, filter_idx) = apply_filters(filters, data, &Direction::ClientToServer);
+                        // Snapshot the current set per chunk: a hot-swap of a
+                        // SharedFilterSet takes effect from this chunk on,
+                        // atomically (old or new set, never a mix).
+                        let current = filters.current();
+                        let (action, filter_idx) = apply_filters(&current, data, &Direction::ClientToServer);
                         if let Some(idx) = filter_idx {
                             stats.filter_matches.fetch_add(1, Ordering::Relaxed);
                             let kind = if action == FilterAction::Drop || action == FilterAction::DropConnection {
@@ -323,6 +330,7 @@ async fn handle_tcp_connection(
         let event_tx = event_tx.clone();
         let export_tx = export_tx.clone();
         let cancel = cancel.clone();
+        let filters = filters.clone();
 
         let mut s2c_buf = vec![0u8; buffer_size];
         let idle_timeout = std::time::Duration::from_secs(300);
@@ -338,7 +346,9 @@ async fn handle_tcp_connection(
                         if n == 0 { break; }
                         let data = &s2c_buf[..n];
 
-                        let (action, filter_idx) = apply_filters(filters, data, &Direction::ServerToClient);
+                        // Per-chunk snapshot — see c2s comment.
+                        let current = filters.current();
+                        let (action, filter_idx) = apply_filters(&current, data, &Direction::ServerToClient);
                         if let Some(idx) = filter_idx {
                             stats.filter_matches.fetch_add(1, Ordering::Relaxed);
                             let kind = if action == FilterAction::Drop || action == FilterAction::DropConnection {

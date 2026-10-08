@@ -1070,3 +1070,220 @@ async fn test_http2_proxy_upstream_never_reads_body() {
     handle.stop();
     handle.shutdown().await;
 }
+
+/// Live proof of the hot-swap seam: a rule wired to a `SharedFilterSet`
+/// swaps its filter set at runtime WITHOUT an engine restart.
+///
+/// Documented granularity: each chunk is evaluated against the set current at
+/// evaluation time. A restart (the old behavior) would kill connection A the
+/// moment the filter set changes; here A must survive the swap untouched and
+/// only die when IT sends blocked content.
+#[tokio::test]
+async fn test_shared_filter_set_hot_swap_tcp() {
+    // Echo server
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = echo_listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                loop {
+                    let n = stream.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    stream.write_all(&buf[..n]).await.unwrap();
+                }
+            });
+        }
+    });
+
+    let tmp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = tmp.local_addr().unwrap();
+    drop(tmp);
+
+    use harpoon_core::engine::filter::{CompiledFilter, SharedFilterSet};
+
+    // Shared set starts empty: the proxy passes everything.
+    let shared = SharedFilterSet::empty();
+
+    let config = CoreConfig {
+        rules: vec![Rule {
+            name: "hot-swap-tcp".into(),
+            listen: Endpoint::tcp(proxy_addr),
+            target: Endpoint::tcp(echo_addr),
+            // Own filters empty on purpose: with a shared set configured the
+            // shared set is the rule's filter source.
+            filters: vec![],
+            duplicate: None,
+            exporter: None,
+            tls: None,
+            udp_source_mode: harpoon_core::types::rule::UdpSourceMode::Proxy,
+            http2: false,
+            idle_timeout_secs: 30,
+        }],
+        shared_filter_set: Some(shared.clone()),
+        ..CoreConfig::default()
+    };
+
+    let handle = harpoon_core::run(config).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Connection A: opened BEFORE the swap; its exchange completes under the
+    // old (empty) set.
+    let mut a = TcpStream::connect(proxy_addr).await.unwrap();
+    a.write_all(b"ping-a").await.unwrap();
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(2), a.read(&mut buf))
+        .await
+        .expect("conn A echo timeout")
+        .unwrap();
+    assert_eq!(&buf[..n], b"ping-a");
+
+    // HOT SWAP: block "BLOCK" content, killing the connection, without
+    // touching the engine.
+    shared.store(vec![CompiledFilter::new(Filter {
+        kind: FilterKind::Substr("BLOCK".into()),
+        direction: Direction::Both,
+        action_on_match: FilterAction::DropConnection,
+    })
+    .unwrap()]);
+
+    // Connection A must survive the swap (an engine restart would have killed
+    // it) and keep passing non-matching traffic.
+    a.write_all(b"still-ok").await.unwrap();
+    let n = tokio::time::timeout(Duration::from_secs(2), a.read(&mut buf))
+        .await
+        .expect("conn A echo after swap timeout — swap killed existing connection?")
+        .unwrap();
+    assert_eq!(&buf[..n], b"still-ok");
+
+    // New connection B (after swap) sending blocked content is dropped.
+    let mut b = TcpStream::connect(proxy_addr).await.unwrap();
+    b.write_all(b"BLOCK-me").await.unwrap();
+    let res = tokio::time::timeout(Duration::from_secs(2), b.read(&mut buf)).await;
+    match res {
+        Ok(Ok(0)) | Ok(Err(_)) => {} // closed / reset
+        Ok(Ok(n)) => panic!("conn B unexpectedly received {} bytes", n),
+        Err(_) => panic!("conn B not closed after blocked content"),
+    }
+
+    // Per-chunk granularity: even the pre-swap connection A is cut when IT
+    // sends blocked content.
+    a.write_all(b"BLOCK-a").await.unwrap();
+    let res = tokio::time::timeout(Duration::from_secs(2), a.read(&mut buf)).await;
+    match res {
+        Ok(Ok(0)) | Ok(Err(_)) => {}
+        Ok(Ok(n)) => panic!("conn A unexpectedly received {} bytes", n),
+        Err(_) => panic!("conn A not closed after blocked content"),
+    }
+
+    // Swap back to no filters: new connection C passes blocked content.
+    shared.store(vec![]);
+    let mut c = TcpStream::connect(proxy_addr).await.unwrap();
+    c.write_all(b"BLOCK-c fine now").await.unwrap();
+    let n = tokio::time::timeout(Duration::from_secs(2), c.read(&mut buf))
+        .await
+        .expect("conn C echo timeout")
+        .unwrap();
+    assert_eq!(&buf[..n], b"BLOCK-c fine now");
+
+    // The same engine handle served the whole sequence: drops were counted
+    // continuously, proving no restart happened in between.
+    let stats = handle.stats_snapshot();
+    assert_eq!(stats.len(), 1);
+    assert_eq!(stats[0].dropped_packets, 2, "B and A blocked chunks");
+    assert_eq!(stats[0].filter_matches, 2);
+
+    handle.stop();
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_shared_filter_set_hot_swap_udp() {
+    // UDP echo server
+    let echo_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo_sock.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 65507];
+        loop {
+            let (n, addr) = echo_sock.recv_from(&mut buf).await.unwrap();
+            echo_sock.send_to(&buf[..n], addr).await.unwrap();
+        }
+    });
+
+    let tmp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = tmp.local_addr().unwrap();
+    drop(tmp);
+
+    use harpoon_core::engine::filter::{CompiledFilter, SharedFilterSet};
+
+    let shared = SharedFilterSet::empty();
+    let config = CoreConfig {
+        rules: vec![Rule {
+            name: "hot-swap-udp".into(),
+            listen: Endpoint::udp(proxy_addr),
+            target: Endpoint::udp(echo_addr),
+            filters: vec![],
+            duplicate: None,
+            exporter: None,
+            tls: None,
+            udp_source_mode: harpoon_core::types::rule::UdpSourceMode::Proxy,
+            http2: false,
+            idle_timeout_secs: 30,
+        }],
+        shared_filter_set: Some(shared.clone()),
+        ..CoreConfig::default()
+    };
+
+    let handle = harpoon_core::run(config).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut buf = [0u8; 1024];
+
+    // Before swap: passes.
+    client.send_to(b"ping", proxy_addr).await.unwrap();
+    let n = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+        .await
+        .expect("udp echo timeout before swap")
+        .unwrap()
+        .0;
+    assert_eq!(&buf[..n], b"ping");
+
+    // Hot swap: drop datagrams containing "BLOCK".
+    shared.store(vec![CompiledFilter::new(Filter {
+        kind: FilterKind::Substr("BLOCK".into()),
+        direction: Direction::Both,
+        action_on_match: FilterAction::Drop,
+    })
+    .unwrap()]);
+
+    // Blocked datagram: silently dropped, no echo.
+    client.send_to(b"BLOCK-pkt", proxy_addr).await.unwrap();
+    let res = tokio::time::timeout(Duration::from_millis(300), client.recv_from(&mut buf)).await;
+    assert!(res.is_err(), "blocked udp datagram was not dropped");
+
+    // Same client/session still works for allowed datagrams.
+    client.send_to(b"ping2", proxy_addr).await.unwrap();
+    let n = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+        .await
+        .expect("udp echo timeout after swap")
+        .unwrap()
+        .0;
+    assert_eq!(&buf[..n], b"ping2");
+
+    // Swap back: blocked content passes again.
+    shared.store(vec![]);
+    client.send_to(b"BLOCK-again", proxy_addr).await.unwrap();
+    let n = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+        .await
+        .expect("udp echo timeout after swap-back")
+        .unwrap()
+        .0;
+    assert_eq!(&buf[..n], b"BLOCK-again");
+
+    handle.stop();
+    handle.shutdown().await;
+}

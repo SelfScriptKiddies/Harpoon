@@ -6,7 +6,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::capture::CaptureManager;
-use crate::engine::filter::CompiledFilter;
+use crate::engine::filter::{CompiledFilter, FilterView, SharedFilterSet};
 use crate::error::HarpoonError;
 use crate::export::sink::run_exporter;
 use crate::pipeline::compile::*;
@@ -23,7 +23,9 @@ pub struct TcpParams {
     pub name: String,
     pub listen_addr: SocketAddr,
     pub target_addr: SocketAddr,
-    pub filters: Arc<Vec<CompiledFilter>>,
+    /// Filter set consulted per evaluated chunk. `Static` = compiled once at
+    /// spawn (classic behavior); `Shared` = hot-swappable without restart.
+    pub filters: FilterView,
     pub duplicate_addr: Option<SocketAddr>,
     pub buffer_size: usize,
     pub tcp_nodelay: bool,
@@ -43,7 +45,9 @@ pub struct UdpParams {
     pub name: String,
     pub listen_addr: SocketAddr,
     pub target_addr: SocketAddr,
-    pub filters: Arc<Vec<CompiledFilter>>,
+    /// Filter set consulted per datagram. `Static` = compiled once at spawn;
+    /// `Shared` = hot-swappable without restart.
+    pub filters: FilterView,
     pub duplicate_addr: Option<SocketAddr>,
     pub capture: Arc<CaptureManager>,
     /// Force-cancel token for active sessions (graceful drain).
@@ -54,6 +58,10 @@ pub struct UdpParams {
 }
 
 /// Dispatch an ExecutionPlan to the appropriate executor.
+///
+/// `shared_filters`: when Some, Linear-tier pipelines evaluate traffic
+/// against this hot-swappable set instead of their compiled-in filters.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_plan(
     plan: ExecutionPlan,
     stats: Arc<RuleStats>,
@@ -65,6 +73,7 @@ pub fn spawn_plan(
     tcp_nodelay: bool,
     export_channel_capacity: usize,
     capture: Arc<CaptureManager>,
+    shared_filters: Option<SharedFilterSet>,
     #[cfg(feature = "tls")] ca: Option<Arc<CertAuthority>>,
 ) -> JoinHandle<Result<(), HarpoonError>> {
     match plan {
@@ -78,7 +87,7 @@ pub fn spawn_plan(
         ExecutionPlan::Linear(p) => {
             spawn_linear(
                 p, stats, event_tx, cancel, force_cancel, buffer_size, max_datagram,
-                tcp_nodelay, export_channel_capacity, capture,
+                tcp_nodelay, export_channel_capacity, capture, shared_filters,
                 #[cfg(feature = "tls")] ca,
             )
         }
@@ -112,7 +121,7 @@ fn spawn_fast_forward(
                 name: plan.pipeline_name,
                 listen_addr: plan.source.endpoint.addr,
                 target_addr: plan.forward.endpoint.addr,
-                filters: Arc::new(vec![]),
+                filters: FilterView::empty(),
                 duplicate_addr: None,
                 buffer_size,
                 tcp_nodelay,
@@ -131,7 +140,7 @@ fn spawn_fast_forward(
                 name: plan.pipeline_name,
                 listen_addr: plan.source.endpoint.addr,
                 target_addr: plan.forward.endpoint.addr,
-                filters: Arc::new(vec![]),
+                filters: FilterView::empty(),
                 duplicate_addr: None,
                 capture: capture.clone(),
                 force_cancel,
@@ -157,14 +166,22 @@ fn spawn_linear(
     tcp_nodelay: bool,
     export_channel_capacity: usize,
     capture: Arc<CaptureManager>,
+    shared_filters: Option<SharedFilterSet>,
     #[cfg(feature = "tls")] ca: Option<Arc<CertAuthority>>,
 ) -> JoinHandle<Result<(), HarpoonError>> {
-    // Compile filters
-    let filters: Vec<CompiledFilter> = plan
-        .filters
-        .iter()
-        .filter_map(|f| CompiledFilter::new(f.clone()).ok())
-        .collect();
+    // Filter source: the hot-swappable shared set when configured, otherwise
+    // the pipeline's own filters compiled once here (classic static behavior).
+    let filters = match shared_filters {
+        Some(set) => FilterView::Shared(set),
+        None => {
+            let compiled: Vec<CompiledFilter> = plan
+                .filters
+                .iter()
+                .filter_map(|f| CompiledFilter::new(f.clone()).ok())
+                .collect();
+            FilterView::Static(Arc::new(compiled))
+        }
+    };
 
     // Setup exporter
     let export_tx = plan.exporter.map(|exp_cfg| {
@@ -182,7 +199,7 @@ fn spawn_linear(
                 name: plan.pipeline_name,
                 listen_addr: plan.source.endpoint.addr,
                 target_addr: plan.forward.endpoint.addr,
-                filters: Arc::new(filters),
+                filters: filters.clone(),
                 duplicate_addr: dup_addr,
                 buffer_size,
                 tcp_nodelay,
@@ -204,7 +221,7 @@ fn spawn_linear(
                 name: plan.pipeline_name,
                 listen_addr: plan.source.endpoint.addr,
                 target_addr: plan.forward.endpoint.addr,
-                filters: Arc::new(filters),
+                filters,
                 duplicate_addr: dup_addr,
                 capture: capture.clone(),
                 force_cancel,
@@ -269,7 +286,7 @@ fn spawn_dag(
                         name: plan.pipeline_name,
                         listen_addr: plan.source.endpoint.addr,
                         target_addr: fwd.endpoint.addr,
-                        filters: Arc::new(filters),
+                        filters: FilterView::Static(Arc::new(filters)),
                         duplicate_addr: None,
                         capture,
                         force_cancel,

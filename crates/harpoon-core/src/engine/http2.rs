@@ -19,7 +19,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::capture::{CaptureManager, PacketDirection};
-use crate::engine::filter::{apply_filters, CompiledFilter};
+use crate::engine::filter::{apply_filters, FilterView};
 use crate::error::HarpoonError;
 use crate::types::event::{Event, EventKind};
 use crate::types::filter::{Direction, FilterAction};
@@ -88,7 +88,7 @@ pub async fn http2_proxy(
     client_stream: TcpStream,
     client_addr: std::net::SocketAddr,
     target_addr: std::net::SocketAddr,
-    filters: &[CompiledFilter],
+    filters: &FilterView,
     stats: &RuleStats,
     event_tx: &broadcast::Sender<Event>,
     _export_tx: &Option<mpsc::Sender<Event>>,
@@ -201,8 +201,11 @@ pub async fn http2_proxy(
         header_text.push_str("\r\n");
         let header_bytes = header_text.into_bytes();
 
-        // Apply filters to headers BEFORE reading body — prevents OOM on blocked large payloads
-        let (action, filter_idx) = apply_filters(filters, &header_bytes, &Direction::ClientToServer);
+        // Apply filters to headers BEFORE reading body — prevents OOM on blocked large payloads.
+        // Snapshot the current set per stream: a hot-swapped SharedFilterSet
+        // takes effect for streams evaluated after the swap.
+        let current = filters.current();
+        let (action, filter_idx) = apply_filters(&current, &header_bytes, &Direction::ClientToServer);
         if let Some(idx) = filter_idx {
             stats.filter_matches.fetch_add(1, Ordering::Relaxed);
             let kind = if action == FilterAction::Drop || action == FilterAction::DropConnection {
@@ -308,8 +311,9 @@ pub async fn http2_proxy(
         resp_header_text.push_str("\r\n");
         let resp_header_bytes = resp_header_text.into_bytes();
 
-        // Apply filters to response headers
-        let (resp_action, resp_filter_idx) = apply_filters(filters, &resp_header_bytes, &Direction::ServerToClient);
+        // Apply filters to response headers (per-stream snapshot — see above)
+        let current = filters.current();
+        let (resp_action, resp_filter_idx) = apply_filters(&current, &resp_header_bytes, &Direction::ServerToClient);
         let resp_filter_name = resp_filter_idx.map(|i| format!("filter#{i}"));
         let resp_dropped = resp_action == FilterAction::Drop || resp_action == FilterAction::DropConnection;
 
