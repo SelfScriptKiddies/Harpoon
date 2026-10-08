@@ -5,6 +5,24 @@ use crate::types::rule::{Rule, TlsMode};
 /// Convert a legacy Rule into a Pipeline.
 /// The resulting pipeline will compile to FastForward (Tier 0) or Linear (Tier 1).
 pub fn rule_to_pipeline(rule: &Rule) -> Pipeline {
+    rule_to_pipeline_inner(rule, false)
+}
+
+/// Like [`rule_to_pipeline`], but always emits a Filter stage so the plan
+/// compiles to at least the Linear tier even when the rule carries no owned
+/// filters.
+///
+/// Used when a `SharedFilterSet` is configured on the engine: linear-tier
+/// executors consult the shared set per evaluated chunk, and a FastForward
+/// plan (zero-copy, filterless by design) would silently bypass filtering.
+/// The rule's own `filters` are irrelevant in that mode — the shared set
+/// replaces them — so the emitted Filter stage carries them only for
+/// display/simulation fidelity.
+pub fn rule_to_pipeline_shared(rule: &Rule) -> Pipeline {
+    rule_to_pipeline_inner(rule, true)
+}
+
+fn rule_to_pipeline_inner(rule: &Rule, force_filter_stage: bool) -> Pipeline {
     let mut nodes: Vec<Node> = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
     let mut next_node_id: NodeId = 1;
@@ -52,8 +70,9 @@ pub fn rule_to_pipeline(rule: &Rule) -> Pipeline {
         }
     }
 
-    // Filter node (if any filters)
-    if !rule.filters.is_empty() {
+    // Filter node (if any filters, or forced for shared-filter-set mode so the
+    // plan compiles to Linear where the dynamic set is consulted per chunk)
+    if !rule.filters.is_empty() || force_filter_stage {
         let filter_id = next_node_id;
         nodes.push(Node {
             id: filter_id,
@@ -213,6 +232,32 @@ mod tests {
         let pipeline = rule_to_pipeline(&rule);
         assert_eq!(pipeline.nodes.len(), 3); // source + filter + forward
 
+        let plan = compile(pipeline).unwrap();
+        assert!(matches!(plan, ExecutionPlan::Linear(_)));
+    }
+
+    #[test]
+    fn test_rule_to_pipeline_shared_forces_filter_stage() {
+        // A rule without owned filters would compile to FastForward (no
+        // filtering at all); the shared-filter-set variant must force a
+        // Filter stage so the plan lands in the Linear tier, where the
+        // dynamic set is consulted per chunk.
+        let rule = simple_rule();
+
+        let pipeline = rule_to_pipeline_shared(&rule);
+        assert_eq!(pipeline.nodes.len(), 3); // source + filter + forward
+
+        let plan = compile(pipeline).unwrap();
+        assert!(matches!(plan, ExecutionPlan::Linear(_)));
+
+        // Rules that already have filters keep working through the same path.
+        let mut rule = simple_rule();
+        rule.filters = vec![Filter {
+            kind: FilterKind::Substr("block".into()),
+            direction: Direction::Both,
+            action_on_match: FilterAction::Drop,
+        }];
+        let pipeline = rule_to_pipeline_shared(&rule);
         let plan = compile(pipeline).unwrap();
         assert!(matches!(plan, ExecutionPlan::Linear(_)));
     }

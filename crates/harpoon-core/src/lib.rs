@@ -8,5 +8,6 @@ pub mod tls;
 pub mod types;
 
 pub use config::CoreConfig;
+pub use engine::filter::SharedFilterSet;
 pub use engine::{run, EngineHandle};
 pub use error::HarpoonError;

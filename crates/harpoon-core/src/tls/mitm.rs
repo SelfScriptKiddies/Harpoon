@@ -7,7 +7,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{broadcast, mpsc};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-use crate::engine::filter::{apply_filters, CompiledFilter};
+use crate::engine::filter::{apply_filters, FilterView};
 use crate::error::HarpoonError;
 use crate::types::event::{Event, EventKind};
 use crate::types::filter::{Direction, FilterAction};
@@ -18,13 +18,16 @@ use super::cert::CertAuthority;
 
 /// Handle a TLS connection based on the configured TLS mode.
 /// Returns after the connection is fully proxied or an error occurs.
+///
+/// `filters` is consulted per chunk (a `Shared` set may be hot-swapped at any
+/// time; the set current at evaluation time applies).
 pub async fn handle_tls_connection(
     client_stream: tokio::net::TcpStream,
     client_addr: std::net::SocketAddr,
     target_addr: std::net::SocketAddr,
     tls_mode: &TlsMode,
     ca: &Arc<CertAuthority>,
-    filters: &[CompiledFilter],
+    filters: &FilterView,
     stats: &RuleStats,
     event_tx: &broadcast::Sender<Event>,
     export_tx: &Option<mpsc::Sender<Event>>,
@@ -130,7 +133,7 @@ pub async fn handle_tls_connection(
 async fn proxy_bidirectional<C, U>(
     client: C,
     upstream: U,
-    filters: &[CompiledFilter],
+    filters: &FilterView,
     stats: &RuleStats,
     event_tx: &broadcast::Sender<Event>,
     export_tx: &Option<mpsc::Sender<Event>>,
@@ -153,6 +156,7 @@ where
         let event_tx = event_tx.clone();
         let export_tx = export_tx.clone();
         let cancel = cancel.clone();
+        let filters = filters.clone();
 
         async move {
             let mut buf = vec![0u8; buffer_size];
@@ -163,7 +167,10 @@ where
                         if n == 0 { break; }
                         let data = &buf[..n];
 
-                        let (action, filter_idx) = apply_filters(filters, data, &Direction::ClientToServer);
+                        // Snapshot the current set per chunk: a hot-swapped
+                        // SharedFilterSet applies from this chunk on.
+                        let current = filters.current();
+                        let (action, filter_idx) = apply_filters(&current, data, &Direction::ClientToServer);
                         if let Some(idx) = filter_idx {
                             stats.filter_matches.fetch_add(1, Ordering::Relaxed);
                             let kind = if action == FilterAction::Drop {
@@ -203,6 +210,7 @@ where
         let event_tx = event_tx.clone();
         let export_tx = export_tx.clone();
         let cancel = cancel.clone();
+        let filters = filters.clone();
 
         async move {
             let mut buf = vec![0u8; buffer_size];
@@ -213,7 +221,9 @@ where
                         if n == 0 { break; }
                         let data = &buf[..n];
 
-                        let (action, filter_idx) = apply_filters(filters, data, &Direction::ServerToClient);
+                        // Per-chunk snapshot — see c2s comment.
+                        let current = filters.current();
+                        let (action, filter_idx) = apply_filters(&current, data, &Direction::ServerToClient);
                         if let Some(idx) = filter_idx {
                             stats.filter_matches.fetch_add(1, Ordering::Relaxed);
                             let kind = if action == FilterAction::Drop {

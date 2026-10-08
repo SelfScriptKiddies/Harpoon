@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::CoreConfig;
 use crate::error::HarpoonError;
-use crate::pipeline::compat::rule_to_pipeline;
+use crate::pipeline::compat::{rule_to_pipeline, rule_to_pipeline_shared};
 use crate::pipeline::compile;
 use crate::types::event::Event;
 use crate::types::pipeline::Pipeline;
@@ -120,11 +120,22 @@ pub async fn run_with_capture(
     let mut handles: Vec<JoinHandle<Result<(), HarpoonError>>> = Vec::new();
     let mut stats_vec = Vec::new();
 
-    // 1. Convert rules to pipelines + append direct pipelines
+    // 1. Convert rules to pipelines + append direct pipelines.
+    // When a shared filter set is configured, rules go through the
+    // shared variant: it forces a Filter stage so the plan compiles to the
+    // Linear tier, where executors consult the (swappable) set per chunk
+    // instead of baking filters into the plan.
+    let shared_filters = config.shared_filter_set.clone();
     let mut all_pipelines: Vec<Pipeline> = config
         .rules
         .iter()
-        .map(rule_to_pipeline)
+        .map(|r| {
+            if shared_filters.is_some() {
+                rule_to_pipeline_shared(r)
+            } else {
+                rule_to_pipeline(r)
+            }
+        })
         .collect();
     all_pipelines.extend(config.pipelines.clone());
 
@@ -171,6 +182,7 @@ pub async fn run_with_capture(
             config.tcp_nodelay,
             config.export_channel_capacity,
             capture.clone(),
+            shared_filters.clone(),
             #[cfg(feature = "tls")]
             ca.clone(),
         );
