@@ -497,6 +497,88 @@ async fn test_pipeline_linear_with_filter() {
     handle.shutdown().await;
 }
 
+/// Regression test for the h2-autodetect peek stall (audit: "every TCP
+/// connection waits an extra 500ms"). A server-first upstream (SMTP/FTP/SSH
+/// style — greeting sent immediately on connect) is proxied through a rule in
+/// the h2-autodetect path: `peek_is_h2` must time out quickly and start plain
+/// forwarding, instead of stalling the full 500ms before the client ever sees
+/// the server's greeting. The old 500ms peek alone blew the 400ms bound below;
+/// with the short `H2_PEEK_TIMEOUT` the roundtrip passes with a wide margin.
+#[cfg(feature = "http2")]
+#[tokio::test]
+async fn test_tcp_server_first_roundtrip_fast() {
+    // Server-first upstream: greeting immediately on accept, then echo
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = upstream_listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                if stream.write_all(b"GREETING hello-from-server\n").await.is_err() {
+                    return;
+                }
+                let mut buf = [0u8; 1024];
+                loop {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if stream.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    let tmp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = tmp.local_addr().unwrap();
+    drop(tmp);
+
+    let config = CoreConfig {
+        rules: vec![Rule {
+            name: "tcp-server-first".into(),
+            listen: Endpoint::tcp(proxy_addr),
+            target: Endpoint::tcp(upstream_addr),
+            filters: vec![],
+            duplicate: None,
+            exporter: None,
+            tls: None,
+            udp_source_mode: harpoon_core::types::rule::UdpSourceMode::Proxy,
+            http2: true, // rule goes through the h2-autodetect peek
+            idle_timeout_secs: 30,
+        }],
+        ..CoreConfig::default()
+    };
+
+    let handle = harpoon_core::run(config).await.unwrap();
+
+    // Give the proxy time to bind
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Full roundtrip: connect → read server greeting → echo back → read echo.
+    let roundtrip = async {
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+
+        let mut buf = [0u8; 64];
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"GREETING hello-from-server\n", "server-first greeting");
+
+        client.write_all(b"ping").await.unwrap();
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"ping", "echo roundtrip");
+    };
+
+    tokio::time::timeout(Duration::from_millis(400), roundtrip)
+        .await
+        .expect("TIMEOUT: server-first roundtrip took >400ms — h2 autodetect peek stall (H2_PEEK_TIMEOUT too large?)");
+
+    handle.stop();
+    handle.shutdown().await;
+}
+
 /// Low-level test: send H2 preface over raw TCP and verify server SETTINGS arrives.
 /// This simulates what grpcio (C core) does and catches SETTINGS flush issues.
 #[cfg(feature = "http2")]
