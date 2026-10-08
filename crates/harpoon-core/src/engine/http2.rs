@@ -28,18 +28,37 @@ use crate::types::stats::RuleStats;
 /// HTTP/2 connection preface (24 bytes).
 pub const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
+/// How long `peek_is_h2` waits for the client's first bytes before falling
+/// back to plain-TCP proxying.
+///
+/// Why a timeout at all: the peek must not block forever on a client that
+/// never speaks — plain TCP server-first protocols (SMTP/FTP/SSH-style, the
+/// client connects and waits for the server's greeting) would deadlock before
+/// the upstream connect ever happens.
+///
+/// Why this short (25ms): RFC 9113 requires an h2 client to send the 24-byte
+/// preface immediately after connection establishment, so a real h2 client's
+/// bytes are already in flight by the time we accept the connection. If
+/// nothing arrives within tens of milliseconds, the client is essentially
+/// never h2 — and every server-first connection pays this timeout in full as
+/// added time-to-first-byte, so a long wait is a latency tax on exactly the
+/// traffic that is not h2.
+///
+/// On misdetection (a genuine h2 client slower than the timeout, or a peek
+/// that returns fewer than 24 bytes): the connection is transparently proxied
+/// as opaque bytes — it still works, just without h2-aware filtering/capture.
+/// Degradation, not breakage, per the stability-first principles of this stack.
+pub const H2_PEEK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(25);
+
 /// Max bytes of body to buffer for capture recording.
 const CAPTURE_BODY_PREFIX: usize = 8192;
 
 /// Check if the first bytes look like an HTTP/2 preface.
-/// Times out after 500ms — if the client hasn't sent data yet, assume plain TCP
-/// (avoids deadlock when the server is expected to speak first).
+/// Waits at most [`H2_PEEK_TIMEOUT`] for the client to speak — see that
+/// constant's docs for why the timeout exists and why it is short.
 pub async fn peek_is_h2(stream: &TcpStream) -> bool {
     let mut buf = [0u8; 24];
-    let peek_result = tokio::time::timeout(
-        std::time::Duration::from_millis(500),
-        stream.peek(&mut buf),
-    ).await;
+    let peek_result = tokio::time::timeout(H2_PEEK_TIMEOUT, stream.peek(&mut buf)).await;
 
     match peek_result {
         Ok(Ok(n)) if n >= 24 => {
