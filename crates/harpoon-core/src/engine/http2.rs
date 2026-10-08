@@ -32,11 +32,33 @@ pub const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const CAPTURE_BODY_PREFIX: usize = 8192;
 
 /// Check if the first bytes look like an HTTP/2 preface.
+/// Times out after 500ms — if the client hasn't sent data yet, assume plain TCP
+/// (avoids deadlock when the server is expected to speak first).
 pub async fn peek_is_h2(stream: &TcpStream) -> bool {
     let mut buf = [0u8; 24];
-    match stream.peek(&mut buf).await {
-        Ok(n) if n >= 24 => &buf[..24] == H2_PREFACE,
-        _ => false,
+    let peek_result = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        stream.peek(&mut buf),
+    ).await;
+
+    match peek_result {
+        Ok(Ok(n)) if n >= 24 => {
+            let is_h2 = &buf[..24] == H2_PREFACE;
+            tracing::debug!(peeked = n, is_h2, "HTTP/2 preface check");
+            is_h2
+        }
+        Ok(Ok(n)) => {
+            tracing::debug!(peeked = n, "HTTP/2 preface check: insufficient bytes");
+            false
+        }
+        Ok(Err(e)) => {
+            tracing::debug!(error = %e, "HTTP/2 preface peek failed");
+            false
+        }
+        Err(_) => {
+            tracing::debug!("HTTP/2 preface peek timed out, assuming plain TCP");
+            false
+        }
     }
 }
 
@@ -55,58 +77,28 @@ pub async fn http2_proxy(
     rule_name: &str,
     capture: &Arc<CaptureManager>,
 ) -> Result<(), HarpoonError> {
-    // TCP_NODELAY is critical for HTTP/2 — Nagle can buffer small frames
-    // (SETTINGS, WINDOW_UPDATE, PING) causing handshake timeouts
     let _ = client_stream.set_nodelay(true);
 
-    // Server handshake: reads client preface + SETTINGS, queues server SETTINGS.
-    // IMPORTANT: server SETTINGS is NOT flushed to the socket here — it only
-    // gets written when the Connection is polled (via accept()).
-    let h2_server = server::handshake(client_stream)
+    // Server handshake: h2 flushes server SETTINGS first, then reads client
+    // preface. By the time this returns, the client has our SETTINGS.
+    tracing::debug!(rule = rule_name, client = %client_addr, "HTTP/2 server handshake starting");
+    let mut h2_server = server::handshake(client_stream)
         .await
         .map_err(|e| HarpoonError::Config(format!("HTTP/2 server handshake failed: {e}")))?;
+    tracing::debug!(rule = rule_name, "HTTP/2 server handshake complete, SETTINGS sent");
 
-    tracing::debug!(rule = rule_name, "HTTP/2 server handshake complete");
-
-    // Immediately spawn the accept loop so the Connection is polled and server
-    // SETTINGS is flushed to the client. Without this, the client would time out
-    // waiting for SETTINGS during the upstream connect + handshake below.
-    let (stream_tx, mut stream_rx) = mpsc::channel::<(
-        http::Request<h2::RecvStream>,
-        h2::server::SendResponse<Bytes>,
-    )>(64);
-    let accept_cancel = cancel.child_token();
-    tokio::spawn(async move {
-        let mut h2_server = h2_server;
-        loop {
-            tokio::select! {
-                result = h2_server.accept() => {
-                    match result {
-                        Some(Ok(pair)) => {
-                            if stream_tx.send(pair).await.is_err() { break; }
-                        }
-                        Some(Err(e)) => {
-                            tracing::debug!(error = %e, "HTTP/2 accept stream error");
-                            break;
-                        }
-                        None => break,
-                    }
-                }
-                _ = accept_cancel.cancelled() => break,
-            }
-        }
-    });
-
-    // Upstream connect + H2 handshake. Server SETTINGS is being flushed
-    // concurrently by the accept task above.
+    // Connect to upstream and do H2 client handshake
+    tracing::debug!(rule = rule_name, target = %target_addr, "connecting to upstream");
     let upstream = TcpStream::connect(target_addr)
         .await
         .map_err(|e| HarpoonError::UpstreamConnect { addr: target_addr, source: e })?;
     let _ = upstream.set_nodelay(true);
 
+    tracing::debug!(rule = rule_name, "upstream H2 handshake starting");
     let (h2_client, h2_conn) = client::handshake(upstream)
         .await
         .map_err(|e| HarpoonError::Config(format!("HTTP/2 client handshake failed: {e}")))?;
+    tracing::debug!(rule = rule_name, "upstream H2 handshake complete");
 
     // Spawn the upstream connection driver
     let conn_cancel = cancel.child_token();
@@ -124,8 +116,15 @@ pub async fn http2_proxy(
     let mut h2_client = h2_client.ready().await
         .map_err(|e| HarpoonError::Config(format!("HTTP/2 client not ready: {e}")))?;
 
-    // Process streams forwarded from the accept task
-    while let Some((request, mut respond)) = stream_rx.recv().await {
+    // Accept and process streams from client
+    while let Some(result) = h2_server.accept().await {
+        let (request, mut respond) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(error = %e, "HTTP/2 accept stream error");
+                break;
+            }
+        };
 
         let (head, mut body) = request.into_parts();
 

@@ -4,6 +4,9 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
+#[cfg(feature = "http2")]
+use bytes::Bytes;
+
 use harpoon_core::config::CoreConfig;
 use harpoon_core::types::endpoint::Endpoint;
 use harpoon_core::types::filter::{Direction, Filter, FilterAction, FilterKind};
@@ -489,6 +492,167 @@ async fn test_pipeline_linear_with_filter() {
 
     let stats = handle.stats_snapshot();
     assert_eq!(stats[0].dropped_packets, 1);
+
+    handle.stop();
+    handle.shutdown().await;
+}
+
+/// Low-level test: send H2 preface over raw TCP and verify server SETTINGS arrives.
+/// This simulates what grpcio (C core) does and catches SETTINGS flush issues.
+#[cfg(feature = "http2")]
+#[tokio::test]
+async fn test_http2_settings_arrives_raw() {
+    // Upstream H2 server
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let (stream, _) = upstream_listener.accept().await.unwrap();
+        let mut conn = h2::server::handshake(stream).await.expect("upstream handshake");
+        while let Some(_) = conn.accept().await {}
+    });
+
+    // Harpoon proxy
+    let tmp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = tmp.local_addr().unwrap();
+    drop(tmp);
+
+    let config = CoreConfig {
+        rules: vec![Rule {
+            name: "h2-raw".into(),
+            listen: Endpoint::tcp(proxy_addr),
+            target: Endpoint::tcp(upstream_addr),
+            filters: vec![],
+            duplicate: None,
+            exporter: None,
+            tls: None,
+            udp_source_mode: harpoon_core::types::rule::UdpSourceMode::Proxy,
+            http2: true,
+            idle_timeout_secs: 30,
+        }],
+        ..CoreConfig::default()
+    };
+
+    let handle = harpoon_core::run(config).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Raw TCP client: send preface manually, then read server SETTINGS
+    let mut tcp = TcpStream::connect(proxy_addr).await.unwrap();
+
+    // Send client preface (what grpcio sends first)
+    tcp.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").await.unwrap();
+
+    // Send a minimal SETTINGS frame (empty SETTINGS = 9 bytes frame header)
+    // Frame header: length(3) = 0x000000, type(1) = 0x04 (SETTINGS), flags(1) = 0x00, stream_id(4) = 0x00000000
+    tcp.write_all(&[0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00]).await.unwrap();
+
+    // Read server response — should contain SETTINGS frame within 2 seconds
+    let mut buf = [0u8; 256];
+    let n = tokio::time::timeout(Duration::from_secs(2), tcp.read(&mut buf))
+        .await
+        .expect("TIMEOUT: server did not send SETTINGS frame!")
+        .expect("read error");
+
+    // Server SETTINGS frame should be at least 9 bytes (frame header)
+    assert!(n >= 9, "expected at least 9 bytes (SETTINGS frame header), got {n}");
+
+    // Check it's a SETTINGS frame: type byte at offset 3 should be 0x04
+    assert_eq!(buf[3], 0x04, "expected SETTINGS frame type (0x04), got 0x{:02x}", buf[3]);
+
+    handle.stop();
+    handle.shutdown().await;
+}
+
+/// Test HTTP/2 proxying through harpoon (reproduces gRPC SETTINGS timeout).
+///
+/// Setup: H2 client → Harpoon proxy (peek_is_h2 → http2_proxy) → H2 echo server
+#[cfg(feature = "http2")]
+#[tokio::test]
+async fn test_http2_proxy_basic() {
+    // 1. Upstream H2 server: accepts H2, echoes request path in response body
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let (stream, _) = upstream_listener.accept().await.unwrap();
+        let mut conn = h2::server::handshake(stream).await.expect("upstream h2 handshake");
+        while let Some(result) = conn.accept().await {
+            let (req, mut respond) = result.expect("upstream accept");
+            let path = req.uri().path().to_string();
+            let response = http::Response::builder().status(200).body(()).unwrap();
+            let mut send = respond.send_response(response, false).unwrap();
+            send.send_data(Bytes::from(format!("echo: {path}")), true).unwrap();
+        }
+    });
+
+    // 2. Harpoon proxy: simple TCP rule, HTTP/2 autodetect will kick in
+    let tmp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = tmp.local_addr().unwrap();
+    drop(tmp);
+
+    let config = CoreConfig {
+        rules: vec![Rule {
+            name: "h2-test".into(),
+            listen: Endpoint::tcp(proxy_addr),
+            target: Endpoint::tcp(upstream_addr),
+            filters: vec![],
+            duplicate: None,
+            exporter: None,
+            tls: None,
+            udp_source_mode: harpoon_core::types::rule::UdpSourceMode::Proxy,
+            http2: true,
+            idle_timeout_secs: 30,
+        }],
+        ..CoreConfig::default()
+    };
+
+    let handle = harpoon_core::run(config).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // 3. H2 client: connect through proxy, send request
+    let tcp = TcpStream::connect(proxy_addr).await.unwrap();
+    let (h2_client, h2_conn) = tokio::time::timeout(
+        Duration::from_secs(5),
+        h2::client::handshake(tcp),
+    )
+    .await
+    .expect("H2 client handshake timed out (SETTINGS not received?)")
+    .expect("H2 client handshake failed");
+
+    tokio::spawn(async move {
+        if let Err(e) = h2_conn.await {
+            eprintln!("H2 client connection error: {e}");
+        }
+    });
+
+    let mut h2_client = h2_client.ready().await.unwrap();
+
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("http://localhost/test-grpc")
+        .body(())
+        .unwrap();
+
+    let (response_future, mut send_stream) = h2_client.send_request(request, false).unwrap();
+    send_stream.send_data(Bytes::from_static(b"request body"), true).unwrap();
+
+    let response = tokio::time::timeout(Duration::from_secs(5), response_future)
+        .await
+        .expect("response timed out")
+        .expect("response error");
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+
+    // Read response body
+    let mut body = response.into_body();
+    let mut response_data = Vec::new();
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk.unwrap();
+        body.flow_control().release_capacity(chunk.len()).unwrap();
+        response_data.extend_from_slice(&chunk);
+    }
+
+    assert_eq!(String::from_utf8(response_data).unwrap(), "echo: /test-grpc");
 
     handle.stop();
     handle.shutdown().await;
