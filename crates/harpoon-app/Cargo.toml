@@ -3,6 +3,7 @@ name = "harpoon-app"
 version = "0.1.1"
 edition = "2021"
 description = "Harpoon MITM/traffic-analysis proxy binary"
+license = "MIT"
 
 [[bin]]
 name = "harpoon"
@@ -17,7 +18,7 @@ http2 = ["harpoon-core/http2"]
 web = ["axum", "tower-http", "include_dir"]
 
 [dependencies]
-harpoon-core = { path = "../harpoon-core" }
+harpoon-core = { path = "../harpoon-core", version = "0.1.0" }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
