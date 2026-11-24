@@ -4,27 +4,34 @@ This guide installs Harpoon on Debian or Ubuntu as a systemd service and publish
 
 systemd starts Harpoon at boot, restarts it after a crash and runs it under a dedicated system user. nginx terminates TLS and forwards requests to the Web UI, which stays bound to loopback. The proxy rules are plain TCP and UDP listeners and do not pass through nginx.
 
-Written and tested on Debian 13 with systemd 257 and nginx 1.26.
+Written and tested on Debian 13 with systemd 257, nginx 1.26 and the `harpoon-full-static` binary of release v1.0.1.
 
 ## Before you start
 
 - A domain name that resolves to the server. The dashboard loads its scripts and API from the root of the host, so it needs a domain or subdomain of its own.
 - TCP ports 80 and 443 open to the server, plus the ports your proxy rules listen on. The Web UI port stays closed, nginx reaches it over loopback.
-- On the build machine: `rustup`, `make` and Node.js 22.
 
-## Step 1: Build and install the binary
+## Step 1: Install the binary
 
-The Web UI has to be compiled in with the `web` feature. A plain `cargo build --release` leaves it out. In a checkout of this repository:
+The releases on GitHub ship `harpoon-full-static`, a statically linked x86-64 binary with the Web UI, TLS MITM, regex filters and transparent UDP compiled in. Nothing has to be built on the server. Download the latest release, check it against the digest that GitHub publishes for it and install it:
 
 ```bash
-rustup target add x86_64-unknown-linux-musl
-sudo apt-get install -y musl-tools
-make static-standard
-sudo install -m 755 dist/harpoon-static /usr/local/bin/harpoon
+sudo apt-get install -y curl python3
+curl -fsSL -o /tmp/harpoon \
+    https://github.com/SelfScriptKiddies/Harpoon/releases/latest/download/harpoon-full-static
+curl -fsSL https://api.github.com/repos/SelfScriptKiddies/Harpoon/releases/latest \
+    | python3 -c 'import json,sys; print([a for a in json.load(sys.stdin)["assets"] if a["name"] == "harpoon-full-static"][0]["digest"].split(":")[1], "/tmp/harpoon")' \
+    | sha256sum -c
+sudo install -m 755 /tmp/harpoon /usr/local/bin/harpoon
 harpoon --help
 ```
 
-`make static-standard` builds the dashboard, embeds it in the binary and writes `dist/harpoon-static`. The binary is statically linked, so you can build it on a workstation and copy it to the server. `make standard` produces the same build against glibc.
+Install the file only when `sha256sum` answers `/tmp/harpoon: OK`.
+
+- Do not take `harpoon-minimal` from the same release. It has no Web UI, and the nginx site in Step 6 would have nothing to forward to.
+- On an `arm64` host, take `harpoon-full` out of `harpoon-linux-arm64.tar.gz` of the same release. That binary is static too, but without transparent UDP.
+- To pin a version, replace `latest/download` in the URL with `download/v1.0.1`.
+- To build the binary yourself, see [Building from source](#building-from-source).
 
 ## Step 2: Create the service user
 
@@ -226,8 +233,21 @@ Open `https://harpoon.example.com` and log in as `admin` with the password from 
 
 - `restart` applies everything: rules, Web UI settings and nftables rules.
 - `reload` replaces rules and pipelines only. Changes to `web_bind`, `web_password` or `[global.nft]` need a `restart`. The command returns before the result is known, so look for `config reloaded successfully` or `config reload failed` in the log.
-- To upgrade, install the new binary with the `install` command from Step 1 and run `sudo systemctl restart harpoon`.
+- To upgrade, download the new release and install it as in Step 1, then run `sudo systemctl restart harpoon`.
 - The Shutdown button in the dashboard and `harpoon stop` end the service with a clean exit, so systemd does not start it again. Bring it back with `sudo systemctl start harpoon`.
+
+## Building from source
+
+Only needed when the releases do not provide the binary you want. The build machine needs `rustup`, `make`, Node.js 22 and `musl-tools`. In a checkout of this repository:
+
+```bash
+rustup target add x86_64-unknown-linux-musl
+sudo apt-get install -y musl-tools
+make static-full
+sudo install -m 755 dist/harpoon-full-static /usr/local/bin/harpoon
+```
+
+`make static-full` builds the dashboard, embeds it in the binary and writes `dist/harpoon-full-static`, statically linked with the same features as the release binary. You can build it on a workstation and copy it to the server. `make static-standard` builds the same binary without TLS MITM, regex filters and transparent UDP. The Web UI has to be compiled in with the `web` feature: a plain `cargo build --release` leaves it out, and nothing is left for nginx to forward to.
 
 ## Troubleshooting
 
@@ -236,7 +256,7 @@ Open `https://harpoon.example.com` and log in as `admin` with the password from 
 | The service keeps restarting or ends up `failed`, and the log shows `nft failed` with `Operation not permitted` | `[global.nft]` is enabled but the service lacks the right | Add `CAP_NET_ADMIN` to `AmbientCapabilities` |
 | The log repeats `nftables enabled in config but 'nft' command not found` | The `nft` binary is missing | `sudo apt-get install nftables` |
 | A rule accepts no connections and has no `pipeline started` line | Its port is taken, or below 1024 without the capability | Free the port, or add `CAP_NET_BIND_SERVICE` |
-| nginx answers `502 Bad Gateway` | Nothing listens where `proxy_pass` points | Check that the binary comes from `make static-standard` and that `web_bind` matches the port in `proxy_pass` |
+| nginx answers `502 Bad Gateway` | Nothing listens where `proxy_pass` points | Check that the installed binary is `harpoon-full-static`, or another build with the `web` feature, and that `web_bind` matches the port in `proxy_pass` |
 | The rule editor answers `failed to save config` | `config.toml` is not writable by the service | `sudo chown root:harpoon /etc/harpoon/config.toml` and `sudo chmod 660 /etc/harpoon/config.toml` |
 | The login page answers `Invalid credentials` for the right password | 10 failed logins within 5 minutes lock the one address Harpoon sees, for everyone | Wait 5 minutes |
 | The log shows `Permission denied` or `No such file or directory` for a file that exists under `/home`, `/root` or `/run/user` | `ProtectHome=yes` hides those directories from the service | Move the file under `/etc/harpoon` |
