@@ -140,7 +140,7 @@ Login: `admin`, password: from config or auto-generated.
 - `POST /api/reload` — reload config
 - `POST /api/stop` — shutdown daemon
 
-Bind to `127.0.0.1` for security. Use `0.0.0.0` only behind a firewall.
+Bind to `127.0.0.1` for security. Use `0.0.0.0` only behind a firewall. To reach the dashboard from another machine, put nginx in front of it: see [Installation with systemd and nginx](docs/install.md).
 
 ## Optional Features
 
@@ -165,6 +165,7 @@ cargo build --release --features "tls,regex-filter,web,transparent-udp"
 
 ## Documentation
 
+- [Installation with systemd and nginx](docs/install.md): install as a systemd service and publish the Web UI through nginx over HTTPS
 - [Configuration Reference](docs/config.md) — all TOML settings, filters, TLS, nftables, web UI
 - [Architecture Overview](docs/architecture.md) — crate structure, design decisions, feature flags
 - [nftables Integration](docs/nftables.md) — REDIRECT, DNAT, TPROXY setup
